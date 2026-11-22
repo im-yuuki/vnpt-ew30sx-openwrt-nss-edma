@@ -240,7 +240,7 @@ jobs:
           current=$(git rev-parse "HEAD:$submodule")
           if [[ "$current" == "$UPSTREAM_COMMIT" ]]; then exit 0; fi
           if [[ "$(git rev-parse HEAD:.gitmodules)" != "$BUILT_GITMODULES" ]] ||
-             ! git diff --quiet "$GITHUB_SHA" HEAD -- patches overlay .github; then
+             ! git diff --quiet "$GITHUB_SHA" HEAD -- patches .github; then
             echo "::error::build inputs changed on $DEFAULT_BRANCH; run CI again"
             exit 1
           fi
@@ -280,15 +280,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: "*-${{ env.TAG }}-*"
-          path: artifacts
+          path: ${{ runner.temp }}/ew30sx-downloads
       - name: Update the gh-pages snapshot
         run: |
           set -euo pipefail
+          downloads="$RUNNER_TEMP/ew30sx-downloads"
           mkdir site
           for flavor in nor ram; do
             mkdir -p "incoming/$flavor"
-            mv "artifacts/firmware-$TAG-$flavor" "incoming/$flavor/firmware"
-            mv "artifacts/kmods-$TAG-$flavor" "incoming/$flavor/apk"
+            mv "$downloads/firmware-$TAG-$flavor" "incoming/$flavor/firmware"
+            mv "$downloads/kmods-$TAG-$flavor" "incoming/$flavor/apk"
           done
           # An empty listing means a missing branch; an auth or network
           # error must stop the job rather than discard the saved builds.
@@ -337,14 +338,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: "*-${{ env.TAG }}-*"
-          path: artifacts
+          path: ${{ runner.temp }}/ew30sx-downloads
       - name: Publish raw firmware and matching kmod archives
         run: |
           set -euo pipefail
+          downloads="$RUNNER_TEMP/ew30sx-downloads"
           mkdir release
           for flavor in nor ram; do
-            firmware="artifacts/firmware-$TAG-$flavor"
-            feed="artifacts/kmods-$TAG-$flavor"
+            firmware="$downloads/firmware-$TAG-$flavor"
+            feed="$downloads/kmods-$TAG-$flavor"
             test -s "$feed/target/packages.adb"
             test -s "$feed/public-key.pem"
             for file in "$firmware"/*; do

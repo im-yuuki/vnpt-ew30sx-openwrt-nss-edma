@@ -10,10 +10,9 @@ cd "$root/openwrt-nss-edma"
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
-mkdir -p files
-cp -a "$root/overlay/files/." files/
+mkdir -p files/etc/apk/repositories.d
 {
-	cat "$root/overlay/files/etc/apk/repositories.d/distfeeds.list"
+	# Official userspace feeds are compatible; official target/kmod indexes are not.
 	if [[ -n ${FEED_URL:-} ]]; then printf '%s/packages.adb\n' "$FEED_URL"; fi
 	for feed in base luci packages routing telephony video; do
 		printf 'https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/%s/packages.adb\n' "$feed"
