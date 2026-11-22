@@ -1,15 +1,13 @@
-From fe3ec6f640411348c9c557ed0694ff08dfff3a57 Mon Sep 17 00:00:00 2001
+From 61260d447def481b18378789959e0a4f8a7f0c20 Mon Sep 17 00:00:00 2001
 From: Yuuki <me@june8th.eu.org>
 Date: Sun, 22 Nov 2026 17:07:11 +0700
-Subject: [PATCH] feat(ipq50xx): enable NSS offload and both APs on EW30SX
+Subject: [PATCH] feat(ipq50xx): enable NSS offload on EW30SX
 
 ---
- package/nss/nss-tools/files/nss-dwmac-up      | 11 ++---
- .../nss/nss-tools/files/nss-dwmac.defaults    | 13 ------
- package/nss/nss-tools/files/nss-dwmac.init    |  8 ++--
- .../etc/hotplug.d/ieee80211/98-ew30sx-ap      | 44 +++++++++++++++++++
- 4 files changed, 53 insertions(+), 23 deletions(-)
- create mode 100755 target/linux/qualcommax/ipq50xx/base-files/etc/hotplug.d/ieee80211/98-ew30sx-ap
+ package/nss/nss-tools/files/nss-dwmac-up       | 11 ++++++-----
+ package/nss/nss-tools/files/nss-dwmac.defaults | 13 -------------
+ package/nss/nss-tools/files/nss-dwmac.init     |  8 +++-----
+ 3 files changed, 9 insertions(+), 23 deletions(-)
 
 diff --git a/package/nss/nss-tools/files/nss-dwmac-up b/package/nss/nss-tools/files/nss-dwmac-up
 index a30cdf9b83..7d60f66b74 100644
@@ -89,56 +87,6 @@ index d92d5f1aa2..f3d47876d4 100644
  	fi
  
  	. /lib/nss/functions.sh
-diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/hotplug.d/ieee80211/98-ew30sx-ap b/target/linux/qualcommax/ipq50xx/base-files/etc/hotplug.d/ieee80211/98-ew30sx-ap
-new file mode 100755
-index 0000000000..ec9d99dad6
---- /dev/null
-+++ b/target/linux/qualcommax/ipq50xx/base-files/etc/hotplug.d/ieee80211/98-ew30sx-ap
-@@ -0,0 +1,44 @@
-+#!/bin/sh
-+# EW30SX: turn on both access points with a WPA key made on this router.
-+# Runs after 10-wifi-detect has created the radio sections. A section is
-+# touched only while it still has mac80211's stock SSID, so an admin's
-+# change is never overwritten. The key is stored in /etc/config/wireless and
-+# kept across reboots, so each board gets its own. No radio is loaded until
-+# the factory calibration is staged, so there is no RF without it.
-+[ "$ACTION" = add ] || exit 0
-+. /lib/functions.sh
-+[ "$(board_name)" = vnpt,ew30sx ] || exit 0
-+[ -e /tmp/ew30sx-wifi-ready ] || exit 0
-+
-+ifaces="$(uci -q show wireless | sed -n 's/^wireless\.\(default_radio[0-9]*\)=wifi-iface$/\1/p')"
-+[ -n "$ifaces" ] || exit 0
-+
-+key=""
-+ssid=""
-+for s in $ifaces; do
-+	[ -n "$key" ] || key="$(uci -q get wireless.$s.key)"
-+	[ -n "$ssid" ] || {
-+		[ "$(uci -q get wireless.$s.ssid)" = OpenWrt ] || ssid="$(uci -q get wireless.$s.ssid)"
-+	}
-+done
-+[ -n "$key" ] || key="$(hexdump -vn 8 -e '8/1 "%02x"' /dev/urandom)"
-+[ -n "$ssid" ] || ssid="EW30SX-$(hexdump -vn 2 -e '2/1 "%02X"' /dev/urandom)"
-+
-+changed=0
-+for s in $ifaces; do
-+	[ "$(uci -q get wireless.$s.ssid)" = OpenWrt ] || continue
-+	dev="$(uci -q get wireless.$s.device)"
-+	[ -n "$dev" ] || continue
-+	uci -q set wireless.$s.ssid="$ssid"
-+	uci -q set wireless.$s.key="$key"
-+	uci -q set wireless.$s.encryption='sae-mixed'
-+	uci -q set wireless.$s.disabled='0'
-+	# No country means the world domain: set Vietnam unless the admin chose one.
-+	[ -n "$(uci -q get wireless.$dev.country)" ] || uci -q set wireless.$dev.country='VN'
-+	changed=1
-+done
-+
-+[ "$changed" = 1 ] || exit 0
-+uci -q commit wireless
-+logger -t wifi "EW30SX: access points enabled (SSID $ssid, WPA key in /etc/config/wireless)"
-+wifi reload
 -- 
 2.56.1
 
