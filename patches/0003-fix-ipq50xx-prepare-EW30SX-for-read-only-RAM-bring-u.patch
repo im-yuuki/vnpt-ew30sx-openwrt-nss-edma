@@ -1,0 +1,569 @@
+From 1ffb2d4db63d5ad161e0f184d4abc123057b8c70 Mon Sep 17 00:00:00 2001
+From: Yuuki <me@june8th.eu.org>
+Date: Sat, 21 Nov 2026 16:23:46 +0700
+Subject: [PATCH 3/7] fix(ipq50xx): prepare EW30SX for read-only RAM bring-up
+
+---
+ package/nss/nss-tools/files/nss-dwmac-up      |  42 +++++--
+ .../nss/nss-tools/files/nss-dwmac.defaults    |  10 ++
+ package/nss/nss-tools/files/nss-dwmac.init    |  28 ++++-
+ .../qualcommax/dts/ipq5018-vnpt-ew30sx.dts    |  81 ++-----------
+ .../files/drivers/mtd/spi-nor/w25q256jw-ro.c  | 110 ++++++++++++++++++
+ .../ipq50xx/base-files/etc/board.d/02_network |   4 +
+ .../base-files/lib/functions/ew30sx-wifi.sh   |  58 +++++++++
+ ...or-build-the-read-only-ew30sx-driver.patch |  10 ++
+ 8 files changed, 260 insertions(+), 83 deletions(-)
+ create mode 100644 target/linux/qualcommax/files/drivers/mtd/spi-nor/w25q256jw-ro.c
+ create mode 100644 target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+ create mode 100644 target/linux/qualcommax/patches-6.18/0976-mtd-spi-nor-build-the-read-only-ew30sx-driver.patch
+
+diff --git a/package/nss/nss-tools/files/nss-dwmac-up b/package/nss/nss-tools/files/nss-dwmac-up
+index d8f1fe7300..271281b503 100644
+--- a/package/nss/nss-tools/files/nss-dwmac-up
++++ b/package/nss/nss-tools/files/nss-dwmac-up
+@@ -4,6 +4,7 @@
+ # netifd ran; this instance starts alongside netifd, waits for the VLAN
+ # topology it builds on the trunk, and brings up connection acceleration.
+ set -e
++. /lib/functions.sh
+ . /lib/nss/functions.sh
+ 
+ [ "$(readlink /sbin/modprobe)" = /sbin/kmodloader ] ||
+@@ -20,6 +21,14 @@ FWM=/sys/kernel/debug/qca-dwmac-nss/fw_mask
+ # before the arm and before ath11k - a board with no radios (measured, E287).
+ TOPOLOGY="$(uci -q get nss.general.topology)" || TOPOLOGY=''
+ TRUNK="$(uci -q get nss.general.trunk)" || TRUNK=''
++EW30SX=0
++ARM=1
++if [ "$(board_name)" = "vnpt,ew30sx" ]; then
++  EW30SX=1
++  TOPOLOGY=''
++  TRUNK="$(nss_gmac_netdevs | sed -n 's/^0://p')"
++  [ -n "$TRUNK" ] || exit 1
++fi
+ # C-3PO: the trunk is the DSA conduit, and the board says which netdev
+ # that is (nss.general.trunk overrides).
+ if [ -z "$TRUNK" ] && [ "$TOPOLOGY" = "dsa" ]; then
+@@ -43,12 +52,21 @@ fi
+ eth_up() {
+   [ "$(cat /sys/class/net/$TRUNK/operstate 2>/dev/null)" = "up" ]
+ }
+-poll_until 30 eth_up || echo "WARN: $TRUNK not up after 30s, arming anyway"
++arm_timeout() {
++  if [ "$EW30SX" = 1 ]; then
++    echo "EW30SX: $1; leaving GMAC0 on the host path"
++    ARM=0
++  else
++    echo "WARN: $1, arming anyway"
++  fi
++}
++
++poll_until 30 eth_up || arm_timeout "$TRUNK not up after 30s"
+ 
+ lan_up() {
+   ubus call network.interface.lan status 2>/dev/null | grep -q '"up": true'
+ }
+-poll_until 30 lan_up || echo "WARN: netifd lan not up after 30s, arming anyway"
++[ "$ARM" = 0 ] || poll_until 30 lan_up || arm_timeout "netifd lan not up after 30s"
+ 
+ eth_promisc() {
+   [ $(( $(cat /sys/class/net/$TRUNK/flags 2>/dev/null || echo 0) & 0x100 )) -ne 0 ]
+@@ -58,15 +76,17 @@ eth_promisc() {
+ # the conduit's hardware VLAN filter and the user ports add their MACs.
+ if [ "$TOPOLOGY" = "dsa" ]; then
+   echo "topology dsa: $TRUNK is the DSA conduit (tagger $(cat /sys/class/net/$TRUNK/dsa/tagging 2>/dev/null))"
+-else
+-  poll_until 15 eth_promisc || echo "WARN: $TRUNK not promiscuous after 15s, arming anyway"
++elif [ "$ARM" = 1 ]; then
++  poll_until 15 eth_promisc || arm_timeout "$TRUNK not promiscuous after 15s"
+ fi
+ 
+ sleep 3
+ 
+-if [ "$(cat $FWM 2>/dev/null)" = "0x0" ]; then
++if [ "$ARM" = 1 ] && [ "$(cat $FWM 2>/dev/null)" = "0x0" ]; then
+   MASK="$(uci -q get nss.general.fw_mask)" || MASK=''
+-  if [ -z "$MASK" ] && [ "$TOPOLOGY" = "dsa" ]; then
++  if [ "$EW30SX" = 1 ]; then
++    MASK=0x1
++  elif [ -z "$MASK" ] && [ "$TOPOLOGY" = "dsa" ]; then
+     # C-3PO: netifd has run, so a GMAC that is up is one that is in use -
+     # the conduit and any WAN PHY of its own get armed, an unused GMAC or
+     # a second CPU port DSA does not use stay on the host.
+@@ -75,7 +95,10 @@ if [ "$(cat $FWM 2>/dev/null)" = "0x0" ]; then
+     echo "topology dsa: fw_mask $MASK from the board (conduit ${NSS_CONDUIT:-none} = phys_if ${NSS_CONDUIT_IF:--}, GMACs $(nss_gmac_netdevs | tr '\n' ' '))"
+   fi
+   [ -n "$MASK" ] || MASK=0x2
+-  echo "$MASK" > $FWM 2>/dev/null
++  if ! (echo "$MASK" > $FWM) 2>/dev/null; then
++    [ "$EW30SX" = 1 ] || exit 1
++    ARM=0
++  fi
+ fi
+ 
+ # Wi-Fi offload is loaded from here, not from the service, because ath11k
+@@ -121,6 +144,7 @@ wifi_load_now() {
+   local offload="$1"
+ 
+   [ "$WIFI_OFFLOAD" = "1" ] || return 0        # the service already loaded it
++  [ "$EW30SX" = 0 ] || [ -e /tmp/ew30sx-wifi-ready ] || return 0
+   grep -q '^ath11k_ahb ' /proc/modules && return 0  # someone got there first
+   # NB: the guard is on ath11k_ahb, not ath11k - the core module may be in
+   # already (a service restart, or a build without this package); it is the
+@@ -257,12 +281,12 @@ wifi_sync_netifd() {
+ }
+ 
+ fw_started() { grep -q started $GLUE_STATUS 2>/dev/null; }
+-poll_until 15 fw_started || {
++if [ "$ARM" = 0 ] || ! poll_until 15 fw_started; then
+   echo "firmware takeover failed - staying on the host data path (same topology)"
+   wifi_load_now 0
+   wifi_sync_netifd
+   exit 1
+-}
++fi
+ 
+ # The core is up: now ath11k can register wifili and get INITIALIZED.
+ wifi_load_now 1
+diff --git a/package/nss/nss-tools/files/nss-dwmac.defaults b/package/nss/nss-tools/files/nss-dwmac.defaults
+index ea2969e733..7b4a500b99 100644
+--- a/package/nss/nss-tools/files/nss-dwmac.defaults
++++ b/package/nss/nss-tools/files/nss-dwmac.defaults
+@@ -380,6 +380,16 @@ if c3po_switch_bound; then
+ fi
+ 
+ board="$(board_name)"
++if [ "$board" = "vnpt,ew30sx" ]; then
++	# GMAC0 is the only enabled MAC. The external fabric and GMAC1
++	# are deliberately not used by the RAM-only diagnostic image.
++	uci -q batch <<-EOF
++		set nss.general.fabric='none'
++		set nss.general.trunk='eth0'
++		set nss.general.trunk_if='0'
++		set nss.general.fw_mask='0x1'
++	EOF
++fi
+ known_board=1
+ if ! nss_dwmac_board_defaults "$board"; then
+ 	known_board=0
+diff --git a/package/nss/nss-tools/files/nss-dwmac.init b/package/nss/nss-tools/files/nss-dwmac.init
+index b5be58578e..cbe4a48a22 100644
+--- a/package/nss/nss-tools/files/nss-dwmac.init
++++ b/package/nss/nss-tools/files/nss-dwmac.init
+@@ -38,6 +38,10 @@ GLUE_STATUS=/sys/kernel/debug/qca-dwmac-nss/status
+ wifi_load() {
+ 	local offload="$1"
+ 
++	if [ "$(board_name)" = "vnpt,ew30sx" ] && [ ! -e /tmp/ew30sx-wifi-ready ]; then
++		return 0
++	fi
++
+ 	modprobe ath11k 2>/dev/null
+ 	[ -w $NSSOFF ] && echo "$offload" > $NSSOFF
+ 	# The firmware carries Wi-Fi as ethernet frames. ath11k defaults to
+@@ -216,12 +220,21 @@ switch_to_8021q() {
+ }
+ 
+ start_service() {
+-	local mask wifi_offload topology
++	local mask wifi_offload topology board ifmap
+ 
+ 	. /lib/nss/functions.sh
+ 
++	board="$(board_name)"
+ 	topology="$(uci -q get nss.general.topology)"
+-	if [ "$topology" = "dsa" ]; then
++	if [ "$board" = "vnpt,ew30sx" ]; then
++		. /lib/functions/ew30sx-wifi.sh
++		if ew30sx_stage_wifi; then
++			logger -t nss "EW30SX: factory data staged in RAM for both radios"
++		else
++			logger -p user.err -t nss "EW30SX: factory data unavailable or invalid; not loading ath11k"
++		fi
++		# Never reconfigure the external switch on this board.
++	elif [ "$topology" = "dsa" ]; then
+ 		switch_to_8021q
+ 	elif ! switch_to_trunk; then
+ 		logger -p user.err -t nss "switch setup failed; refusing NSS takeover"
+@@ -265,11 +278,18 @@ start_service() {
+ 	# no-op when the module is already loaded - and it often is: qca-nss-drv
+ 	# pulls the glue in as a symbol dependency, so kmodloader can get there
+ 	# first and the parameter is then lost without a word.
+-	local trunk trunk_if extra ifmap
++	local trunk trunk_if extra
+ 	trunk="$(uci -q get nss.general.trunk)"
+ 	trunk_if="$(uci -q get nss.general.trunk_if)"
+ 	extra="$(uci -q get nss.general.extra_ports | tr ' ' ',')"
+-	if [ "$topology" = "dsa" ] && [ -z "$trunk$trunk_if$extra" ]; then
++	if [ "$board" = "vnpt,ew30sx" ]; then
++		ifmap="$(nss_gmac_netdevs | grep '^0:')"
++		if [ -z "$ifmap" ]; then
++			logger -p user.err -t nss "EW30SX: no GMAC0 netdev; not arming NSS"
++			wifi_load 0
++			return 0
++		fi
++	elif [ "$topology" = "dsa" ] && [ -z "$trunk$trunk_if$extra" ]; then
+ 		# C-3PO: every GMAC that has a netdev, by the node it sits on.
+ 		# Which of them the firmware gets is nss-dwmac-up's call, once
+ 		# netifd has said which ones are in use (nss_dsa_fw_mask).
+diff --git a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
+index d8035e804d..d6ec26af6b 100644
+--- a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
++++ b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
+@@ -21,6 +21,7 @@
+ 
+ 	chosen {
+ 		stdout-path = "serial0:115200n8";
++		bootargs-append = " earlycon";
+ 	};
+ 
+ 	memory@40000000 {
+@@ -29,8 +30,8 @@
+ 
+ 	reserved-memory {
+ 		/*
+-		 * 256 MiB MP02 layout: user-PD2/QCN6122 firmware and dump
+-		 * regions. Keep the unused tail reserved as in the live tree.
++		 * OpenWrt multi-PD layout: user-PD2/QCN6122 data and M3 dump.
++		 * Reserve the rest of the stock WCSS window as well.
+ 		 */
+ 		q6_region_qcn6122_1: q6-region-qcn6122-1@4d200000 {
+ 			reg = <0x0 0x4d200000 0x0 0xd00000>;
+@@ -123,93 +124,33 @@
+ 	status = "okay";
+ };
+ 
+-/* Keep NOR inactive until the JEDEC geometry has been verified. */
++/* Expose only factory inputs through the driver that cannot write NOR. */
+ &blsp1_spi1 {
+ 	pinctrl-0 = <&spi_0_pins>;
+ 	pinctrl-names = "default";
+-	status = "disabled";
++	status = "okay";
+ 
+ 	flash@0 {
+-		compatible = "jedec,spi-nor";
++		compatible = "vnpt,ew30sx-calibration-nor";
+ 		reg = <0>;
+-		spi-max-frequency = <50000000>;
++		spi-max-frequency = <25000000>;
+ 
+ 		partitions {
+ 			compatible = "fixed-partitions";
+ 			#address-cells = <1>;
+ 			#size-cells = <1>;
+ 
+-			partition@0 {
+-				label = "0:SBL1";
+-				reg = <0x0 0x30000>;
+-				read-only;
+-			};
+-
+-			partition@30000 {
+-				label = "0:MIBIB";
+-				reg = <0x30000 0x10000>;
+-				read-only;
+-			};
+-
+-			partition@40000 {
+-				label = "0:QSEE";
+-				reg = <0x40000 0xa0000>;
+-				read-only;
+-			};
+-
+-			partition@e0000 {
+-				label = "0:DEVCFG";
+-				reg = <0xe0000 0x10000>;
+-				read-only;
+-			};
+-
+-			partition@f0000 {
+-				label = "0:CDT";
+-				reg = <0xf0000 0x10000>;
+-				read-only;
+-			};
+-
+-			partition@100000 {
+-				label = "0:APPSBLENV";
+-				reg = <0x100000 0x10000>;
+-				read-only;
+-			};
+-
+-			partition@110000 {
+-				label = "0:APPSBL";
+-				reg = <0x110000 0xa0000>;
+-				read-only;
+-			};
+-
+ 			partition@1b0000 {
+ 				label = "0:ART";
+ 				reg = <0x1b0000 0x70000>;
+ 				read-only;
+ 			};
+ 
+-			partition@220000 {
+-				label = "0:HLOS";
+-				reg = <0x220000 0x500000>;
+-				read-only;
+-			};
+-
+-			partition@720000 {
+-				label = "rootfs";
+-				reg = <0x720000 0x1400000>;
+-				read-only;
+-			};
+-
+ 			partition@1b20000 {
+ 				label = "0:WIFIFW";
+ 				reg = <0x1b20000 0x400000>;
+ 				read-only;
+ 			};
+-
+-			partition@1f20000 {
+-				label = "0:BTFW";
+-				reg = <0x1f20000 0x40000>;
+-				read-only;
+-			};
+ 		};
+ 	};
+ };
+@@ -242,7 +183,7 @@
+ 	status = "okay";
+ };
+ 
+-/* Probe PHY IDs without driving the unverified board reset line. */
++/* Probe PHY IDs without driving GPIO26 (the stock switch reset). */
+ &mdio1 {
+ 	pinctrl-0 = <&mdio1_pins>;
+ 	pinctrl-names = "default";
+@@ -339,8 +280,8 @@
+ 
+ &q6v5_wcss {
+ 	/*
+-	 * Match the live MP02 fixup: integrated radio on UPD3/reset GPIO15,
+-	 * QCN6122 on UPD2/reset GPIO27.
++	 * Match live MP02: PCIe0/UPD3/reset GPIO15 and
++	 * PCIe1/UPD2/reset GPIO27 (QCN6122). The internal radio is UPD1.
+ 	 */
+ 	boot-args = <0x1 4 3 15 0 0 0x2 4 2 27 0 0>;
+ 	status = "okay";
+@@ -350,7 +291,7 @@
+ 	status = "okay";
+ };
+ 
+-/* IPQ5018 integrated 2.4 GHz radio: leave board data to a verified source. */
++/* Board data for both radios is staged from this unit before ath11k binds. */
+ &wifi {
+ 	status = "okay";
+ 	qcom,rproc = <&q6v5_wcss>;
+diff --git a/target/linux/qualcommax/files/drivers/mtd/spi-nor/w25q256jw-ro.c b/target/linux/qualcommax/files/drivers/mtd/spi-nor/w25q256jw-ro.c
+new file mode 100644
+index 0000000000..d60be26977
+--- /dev/null
++++ b/target/linux/qualcommax/files/drivers/mtd/spi-nor/w25q256jw-ro.c
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Read-only access to the EW30SX factory data for RAM-only bring-up.
++ * Use dedicated 4-byte reads in either address mode; never write a
++ * register, change the address mode, program or erase the flash.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/partitions.h>
++#include <linux/of.h>
++#include <linux/sizes.h>
++#include <linux/spi/spi.h>
++#include <linux/unaligned.h>
++
++static int ew30sx_nor_read(struct mtd_info *mtd, loff_t from, size_t len,
++			   size_t *retlen, u_char *buf)
++{
++	struct spi_device *spi = mtd->priv;
++	u8 cmd[5] = { 0x13 };
++	size_t max_size;
++	int ret;
++
++	if (spi_max_message_size(spi) <= sizeof(cmd) ||
++	    spi_max_transfer_size(spi) < sizeof(cmd))
++		return -EOPNOTSUPP;
++
++	max_size = min3((size_t)SZ_4K, spi_max_transfer_size(spi),
++			spi_max_message_size(spi) - sizeof(cmd));
++	*retlen = 0;
++	while (len) {
++		size_t count = min(len, max_size);
++
++		put_unaligned_be32(from, cmd + 1);
++		ret = spi_write_then_read(spi, cmd, sizeof(cmd), buf, count);
++		if (ret)
++			return ret;
++
++		from += count;
++		buf += count;
++		len -= count;
++		*retlen += count;
++	}
++
++	return 0;
++}
++
++static int ew30sx_nor_probe(struct spi_device *spi)
++{
++	static const char * const parsers[] = { "ofpart", NULL };
++	struct mtd_info *mtd;
++	u8 cmd = 0x9f;
++	u8 id[3];
++	int ret;
++
++	ret = spi_write_then_read(spi, &cmd, 1, id, sizeof(id));
++	if (ret)
++		return ret;
++
++	/* W25Q256JW and its industrial/industrial-plus variant. */
++	if (id[0] != 0xef || (id[1] != 0x60 && id[1] != 0x80) || id[2] != 0x19)
++		return dev_err_probe(&spi->dev, -ENODEV,
++				     "expected W25Q256JW, got JEDEC %*phN\n",
++				     (int)sizeof(id), id);
++
++	mtd = devm_kzalloc(&spi->dev, sizeof(*mtd), GFP_KERNEL);
++	if (!mtd)
++		return -ENOMEM;
++
++	mtd->name = dev_name(&spi->dev);
++	mtd->dev.parent = &spi->dev;
++	mtd->owner = THIS_MODULE;
++	mtd->type = MTD_NORFLASH;
++	mtd->flags = MTD_CAP_ROM | MTD_NO_ERASE;
++	mtd->size = SZ_32M;
++	mtd->erasesize = SZ_64K;
++	mtd->writesize = 1;
++	mtd->writebufsize = 1;
++	mtd->priv = spi;
++	mtd->_read = ew30sx_nor_read;
++	mtd_set_of_node(mtd, spi->dev.of_node);
++	spi_set_drvdata(spi, mtd);
++
++	return mtd_device_parse_register(mtd, parsers, NULL, NULL, 0);
++}
++
++static void ew30sx_nor_remove(struct spi_device *spi)
++{
++	mtd_device_unregister(spi_get_drvdata(spi));
++}
++
++static const struct of_device_id ew30sx_nor_of_match[] = {
++	{ .compatible = "vnpt,ew30sx-calibration-nor" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, ew30sx_nor_of_match);
++
++static struct spi_driver ew30sx_nor_driver = {
++	.driver = {
++		.name = "ew30sx-calibration-nor",
++		.of_match_table = ew30sx_nor_of_match,
++	},
++	.probe = ew30sx_nor_probe,
++	.remove = ew30sx_nor_remove,
++};
++module_spi_driver(ew30sx_nor_driver);
++
++MODULE_DESCRIPTION("Read-only W25Q256JW access for EW30SX RAM boot");
++MODULE_LICENSE("GPL");
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
+index 002777248f..401cf9a245 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
++++ b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
+@@ -7,6 +7,10 @@ ipq50xx_setup_interfaces()
+ {
+ 	local board="$1"
+ 	case $board in
++	vnpt,ew30sx)
++		# GMAC0 is an isolated bench management port in the RAM image.
++		ucidef_set_interface_lan "eth0"
++		;;
+ 	elecom,wrc-x3000gs2|\
+ 	elecom,wrc-x3000gst2|\
+ 	iodata,wn-dax3000gr|\
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh b/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+new file mode 100644
+index 0000000000..aa2aae1628
+--- /dev/null
++++ b/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+@@ -0,0 +1,58 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++# Check the fixed map and the kernel's MTD_WRITEABLE bit, not just the label.
++ew30sx_mtd() {
++	local id dev flags
++
++	id="$(find_mtd_index "$1")"
++	case "$id" in ''|*[!0-9]*) return 1 ;; esac
++	dev="/sys/class/mtd/mtd$id"
++	[ "$(cat "$dev/offset")" = "$2" ] || return 1
++	[ "$(cat "$dev/size")" = "$3" ] || return 1
++	flags="$(cat "$dev/flags")" || return 1
++	[ $((flags & 0x400)) -eq 0 ] || return 1
++	echo "$id"
++}
++
++ew30sx_check_blob() {
++	[ "$(wc -c < "$1")" = 131072 ] &&
++		[ "$(tr -d '\000\377' < "$1" | wc -c)" -gt 0 ]
++}
++
++# The stock MP02 script reads raw 128 KiB slices from ART. Stock's BDFs
++# are separate files in the WIFIFW SquashFS. Do not keep a copy of ART,
++# use stock executable firmware, or patch the factory bytes.
++ew30sx_stage_wifi() (
++	local art wififw dir fw
++
++	[ -e /tmp/ew30sx-wifi-ready ] && return 0
++	art="$(ew30sx_mtd 0:ART 1769472 458752)" || return 1
++	wififw="$(ew30sx_mtd 0:WIFIFW 28442624 4194304)" || return 1
++	[ -c "/dev/mtd${art}ro" ] && [ -b "/dev/mtdblock$wififw" ] || return 1
++
++	umask 077
++	dir="$(mktemp -d /tmp/ew30sx-wifi.XXXXXX)" || return 1
++	mkdir "$dir/stock" || { rmdir "$dir"; return 1; }
++	trap 'umount "$dir/stock" 2>/dev/null
++		rm -f "$dir/bdf-2g" "$dir/bdf-5g" "$dir/cal-2g" "$dir/cal-5g"
++		rmdir "$dir/stock" "$dir" 2>/dev/null' EXIT
++	mount -t squashfs -o ro,nodev,nosuid,noexec "/dev/mtdblock$wififw" "$dir/stock" ||
++		return 1
++
++	cp "$dir/stock/bdwlan.b10" "$dir/bdf-2g" &&
++		cp "$dir/stock/qcn6122/bdwlan.b90" "$dir/bdf-5g" &&
++		dd if="/dev/mtd${art}ro" of="$dir/cal-2g" bs=2048 skip=2 count=64 2>/dev/null &&
++		dd if="/dev/mtd${art}ro" of="$dir/cal-5g" bs=2048 skip=77 count=64 2>/dev/null ||
++		return 1
++	umount "$dir/stock" || return 1
++	for fw in bdf-2g bdf-5g cal-2g cal-5g; do
++		ew30sx_check_blob "$dir/$fw" || return 1
++	done
++
++	fw=/lib/firmware/ath11k
++	cp "$dir/bdf-2g" "$fw/IPQ5018/hw1.0/board.bin" &&
++		cp "$dir/bdf-5g" "$fw/QCN6122/hw1.0/board.bin" &&
++		cp "$dir/cal-2g" "$fw/IPQ5018/hw1.0/cal-ahb-c000000.wifi.bin" &&
++		cp "$dir/cal-5g" "$fw/QCN6122/hw1.0/cal-ahb-b00a040.wifi.bin" &&
++		touch /tmp/ew30sx-wifi-ready
++)
+diff --git a/target/linux/qualcommax/patches-6.18/0976-mtd-spi-nor-build-the-read-only-ew30sx-driver.patch b/target/linux/qualcommax/patches-6.18/0976-mtd-spi-nor-build-the-read-only-ew30sx-driver.patch
+new file mode 100644
+index 0000000000..85287b3baf
+--- /dev/null
++++ b/target/linux/qualcommax/patches-6.18/0976-mtd-spi-nor-build-the-read-only-ew30sx-driver.patch
+@@ -0,0 +1,10 @@
++Subject: [PATCH] mtd: spi-nor: build the read-only EW30SX driver
++
++--- a/drivers/mtd/spi-nor/Makefile
+++++ b/drivers/mtd/spi-nor/Makefile
++@@ -18,4 +18,5 @@ spi-nor-objs			+= xtx.o
++ spi-nor-$(CONFIG_DEBUG_FS)	+= debugfs.o
++ obj-$(CONFIG_MTD_SPI_NOR)	+= spi-nor.o
+++obj-$(CONFIG_MTD_SPI_NOR)	+= w25q256jw-ro.o
++ 
++ obj-$(CONFIG_MTD_SPI_NOR)	+= controllers/

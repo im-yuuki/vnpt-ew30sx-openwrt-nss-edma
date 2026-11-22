@@ -1,0 +1,119 @@
+From ef8fa6bd605b04c489493e4f36c2711695d00914 Mon Sep 17 00:00:00 2001
+From: Yuuki <me@june8th.eu.org>
+Date: Sat, 21 Nov 2026 06:41:27 +0700
+Subject: [PATCH 2/7] feat(qualcommax): add EW30SX NSS initramfs profile
+
+---
+ .../qualcommax/dts/ipq5018-vnpt-ew30sx.dts    | 54 ++++++++++++++++---
+ target/linux/qualcommax/image/ipq50xx.mk      | 16 ++++++
+ 2 files changed, 62 insertions(+), 8 deletions(-)
+
+diff --git a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
+index e5955d786f..d8035e804d 100644
+--- a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
++++ b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
+@@ -4,6 +4,7 @@
+ 
+ #include "ipq5018.dtsi"
+ #include "ipq5018-ess.dtsi"
++#include "ipq5018-nss.dtsi"
+ #include "ipq5018-qcn6122.dtsi"
+ 
+ #include <dt-bindings/gpio/gpio.h>
+@@ -28,12 +29,21 @@
+ 
+ 	reserved-memory {
+ 		/*
+-		 * Retain the full stock WCSS carveout. The QCN6122 include
+-		 * already covers its first 34 MiB; keep the rest out of RAM
+-		 * without assuming the second PD's firmware layout.
++		 * 256 MiB MP02 layout: user-PD2/QCN6122 firmware and dump
++		 * regions. Keep the unused tail reserved as in the live tree.
+ 		 */
+-		wcss-reserved@4d200000 {
+-			reg = <0x0 0x4d200000 0x0 0x1200000>;
++		q6_region_qcn6122_1: q6-region-qcn6122-1@4d200000 {
++			reg = <0x0 0x4d200000 0x0 0xd00000>;
++			no-map;
++		};
++
++		m3_dump_qcn6122_1: m3-dump-qcn6122-1@4df00000 {
++			reg = <0x0 0x4df00000 0x0 0x100000>;
++			no-map;
++		};
++
++		wcss-reserved-tail@4e000000 {
++			reg = <0x0 0x4e000000 0x0 0x400000>;
+ 			no-map;
+ 		};
+ 	};
+@@ -327,11 +337,39 @@
+ 	};
+ };
+ 
+-/* Both radios remain disabled until WCSS, BDF and per-unit data are known. */
+ &q6v5_wcss {
+-	status = "disabled";
++	/*
++	 * Match the live MP02 fixup: integrated radio on UPD3/reset GPIO15,
++	 * QCN6122 on UPD2/reset GPIO27.
++	 */
++	boot-args = <0x1 4 3 15 0 0 0x2 4 2 27 0 0>;
++	status = "okay";
+ };
+ 
+ &wcss {
+-	status = "disabled";
++	status = "okay";
++};
++
++/* IPQ5018 integrated 2.4 GHz radio: leave board data to a verified source. */
++&wifi {
++	status = "okay";
++	qcom,rproc = <&q6v5_wcss>;
++	qcom,ath11k-fw-memory-mode = <2>;
++	ieee80211-freq-limit = <2400000 2483000>;
++};
++
++/* The EW30SX stock MP02 tree has one QCN6122 on user PD2. */
++&wifi1 {
++	status = "okay";
++	qcom,rproc = <&q6v5_wcss>;
++	qcom,ath11k-fw-memory-mode = <2>;
++	ieee80211-freq-limit = <5150000 5850000>;
++	memory-region = <&q6_region_qcn6122_1>, <&q6_region_ipq5018>,
++			<&m3_dump_qcn6122_1>;
++	memory-region-names = "q6-region", "m3-region", "m3-dump";
++};
++
++/* Match the verified 8 MiB stock NSS aperture on this 256 MiB board. */
++&nss_region {
++	reg = <0x0 0x40000000 0x0 0x800000>;
+ };
+diff --git a/target/linux/qualcommax/image/ipq50xx.mk b/target/linux/qualcommax/image/ipq50xx.mk
+index a1dcaa3f71..532a5c19d4 100644
+--- a/target/linux/qualcommax/image/ipq50xx.mk
++++ b/target/linux/qualcommax/image/ipq50xx.mk
+@@ -797,6 +797,22 @@ define Device/tplink_eap650-outdoor-v1
+ endef
+ TARGET_DEVICES += tplink_eap650-outdoor-v1
+ 
++define Device/vnpt_ew30sx
++	$(call Device/FitImage)
++	DEVICE_VENDOR := VNPT
++	DEVICE_MODEL := iGate EW30SX
++	DEVICE_DTS := ipq5018-vnpt-ew30sx
++	DEVICE_DTS_CONFIG := config@mp02.1
++	SOC := ipq5018
++	IMAGES :=
++	KERNEL_INITRAMFS := kernel-bin | libdeflate-gzip | fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd
++	DEVICE_PACKAGES := ath11k-firmware-ipq5018-qcn6122 \
++		nss-tools-dwmac \
++		ip-full \
++		iperf3
++endef
++TARGET_DEVICES += vnpt_ew30sx
++
+ define Device/tplink_re700x
+ 	$(call Device/FitImage)
+ 	$(call Device/UbiFit)

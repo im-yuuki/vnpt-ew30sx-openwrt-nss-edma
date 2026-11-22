@@ -1,0 +1,309 @@
+From c4b564257fe061d577e9e29f9d698adfde1843d6 Mon Sep 17 00:00:00 2001
+From: Yuuki <me@june8th.eu.org>
+Date: Sun, 22 Nov 2026 15:46:12 +0700
+Subject: [PATCH 6/7] feat(ipq50xx): build split EW30SX NOR beta
+
+---
+ .../dts/ipq5018-vnpt-ew30sx-nor.dts           |  33 ++++
+ target/linux/qualcommax/image/ipq50xx.mk      |  32 +++-
+ .../base-files/lib/functions/ew30sx-wifi.sh   | 151 ++++++++++++++----
+ .../base-files/lib/upgrade/platform.sh        |   8 +
+ 4 files changed, 188 insertions(+), 36 deletions(-)
+ create mode 100644 target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx-nor.dts
+
+diff --git a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx-nor.dts b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx-nor.dts
+new file mode 100644
+index 0000000000..b757979fc8
+--- /dev/null
++++ b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx-nor.dts
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++
++#include "ipq5018-vnpt-ew30sx.dts"
++
++/ {
++	chosen {
++		bootargs-append = " earlycon rootfstype=squashfs";
++	};
++};
++
++/* Use the stock NOR boundaries; rootfs_data is split from rootfs. */
++&blsp1_spi1 {
++	flash@0 {
++		compatible = "jedec,spi-nor";
++		/* Restore the address mode on shutdown if dedicated opcodes are absent. */
++		broken-flash-reset;
++
++		partitions {
++			partition@220000 {
++				label = "0:HLOS";
++				reg = <0x220000 0x500000>;
++				read-only;
++			};
++
++			partition@720000 {
++				label = "rootfs";
++				reg = <0x720000 0x1400000>;
++				/* mtdsplit registers writable rootfs_data as a sibling. */
++				read-only;
++			};
++		};
++	};
++};
+diff --git a/target/linux/qualcommax/image/ipq50xx.mk b/target/linux/qualcommax/image/ipq50xx.mk
+index b11a043181..ccc05732a1 100644
+--- a/target/linux/qualcommax/image/ipq50xx.mk
++++ b/target/linux/qualcommax/image/ipq50xx.mk
+@@ -797,23 +797,45 @@ define Device/tplink_eap650-outdoor-v1
+ endef
+ TARGET_DEVICES += tplink_eap650-outdoor-v1
+ 
+-define Device/vnpt_ew30sx
+-	$(call Device/FitImage)
++define Device/vnpt_ew30sx-common
+ 	DEVICE_VENDOR := VNPT
+ 	DEVICE_MODEL := iGate EW30SX
+-	DEVICE_DTS := ipq5018-vnpt-ew30sx
+ 	DEVICE_DTS_CONFIG := config@mp02.1
+ 	SOC := ipq5018
+-	IMAGES :=
+-	KERNEL_INITRAMFS := kernel-bin | libdeflate-gzip | fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd
++	SUPPORTED_DEVICES := vnpt,ew30sx
+ 	DEVICE_PACKAGES := ath11k-firmware-ipq5018-qcn6122 \
+ 		nss-tools-dwmac \
+ 		squashfs-tools-unsquashfs \
+ 		ip-full \
+ 		iperf3
+ endef
++
++define Device/vnpt_ew30sx
++	$(call Device/vnpt_ew30sx-common)
++	$(call Device/FitImage)
++	DEVICE_DTS := ipq5018-vnpt-ew30sx
++	IMAGES :=
++	KERNEL_INITRAMFS := kernel-bin | libdeflate-gzip | fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd
++endef
+ TARGET_DEVICES += vnpt_ew30sx
+ 
++define Device/vnpt_ew30sx-nor
++	$(call Device/vnpt_ew30sx-common)
++	$(call Device/FitImageLzma)
++	DEVICE_VARIANT := NOR beta
++	DEVICE_DTS := ipq5018-vnpt-ew30sx-nor
++	BLOCKSIZE := 64k
++	KERNEL_SIZE := 5120k
++	KERNEL_INITRAMFS :=
++	# Keep at least 512 KiB of the 20 MiB rootfs partition for JFFS2.
++	IMAGE_SIZE := 19968k
++	FILESYSTEMS := squashfs
++	IMAGES := kernel.itb rootfs.squashfs
++	IMAGE/kernel.itb := append-kernel | check-size $$(KERNEL_SIZE)
++	IMAGE/rootfs.squashfs := append-rootfs | pad-rootfs | check-size $$(IMAGE_SIZE)
++endef
++TARGET_DEVICES += vnpt_ew30sx-nor
++
+ define Device/tplink_re700x
+ 	$(call Device/FitImage)
+ 	$(call Device/UbiFit)
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh b/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+index a7f777fbd4..e896dfdbce 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
++++ b/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+@@ -71,12 +71,106 @@ ew30sx_prepare_bdf() {
+ 		[ "$(ew30sx_bdf_axis_checksum "$file")" = "0 $2 $3" ]
+ }
+ 
++ew30sx_wifi_private() {
++	local mode links rest
++
++	[ ! -L "$1" ] && [ -O "$1" ] || return 1
++	# BusyBox stat is not enabled on this target.
++	IFS=' ' read -r mode links rest <<-EOF
++		$(LC_ALL=C ls -ld "$1")
++	EOF
++	case "$mode" in "$2"|"$2".) ;; *) return 1 ;; esac
++	[ "$2" = drwx------ ] || [ "$links" = 1 ]
++}
++
++ew30sx_wifi_ready() {
++	local dir="$1" marker="$2" ipq="$3" qcn="$4" file
++
++	ew30sx_wifi_private "$marker" drwx------ &&
++		ew30sx_wifi_private "$dir" drwx------ &&
++		ew30sx_wifi_private "$dir/ath11k" drwx------ &&
++		ew30sx_wifi_private "${ipq%/*}" drwx------ &&
++		ew30sx_wifi_private "${qcn%/*}" drwx------ &&
++		ew30sx_wifi_private "$ipq" drwx------ &&
++		ew30sx_wifi_private "$qcn" drwx------ ||
++		return 1
++
++	# The loader's custom path is global. Allow only the two radios' files,
++	# never anything that could shadow packaged executable firmware.
++	[ -z "$(LC_ALL=C ls -A1 "$marker")" ] &&
++		[ "$(LC_ALL=C ls -A1 "$dir")" = ath11k ] &&
++		[ "$(LC_ALL=C ls -A1 "$dir/ath11k")" = "$(printf 'IPQ5018\nQCN6122')" ] &&
++		[ "$(LC_ALL=C ls -A1 "${ipq%/*}")" = hw1.0 ] &&
++		[ "$(LC_ALL=C ls -A1 "${qcn%/*}")" = hw1.0 ] &&
++		[ "$(LC_ALL=C ls -A1 "$ipq")" = "$(printf 'board.bin\ncal-ahb-c000000.wifi.bin')" ] &&
++		[ "$(LC_ALL=C ls -A1 "$qcn")" = "$(printf 'board.bin\ncal-ahb-b00a040.wifi.bin')" ] ||
++		return 1
++
++	for file in "$ipq/board.bin" "$ipq/cal-ahb-c000000.wifi.bin" \
++		"$qcn/board.bin" "$qcn/cal-ahb-b00a040.wifi.bin"; do
++		ew30sx_wifi_private "$file" -rw------- &&
++			[ "$(wc -c < "$file")" = 131072 ] || return 1
++	done
++}
++
++ew30sx_wifi_check_api2() {
++	local release root radio file
++
++	# ath11k tries board-2.bin before requesting our board.bin. Do not
++	# let an older overlay board-2.bin bypass the factory data.
++	release="$(uname -r)" || return 1
++	for root in "/lib/firmware/updates/$release" /lib/firmware/updates \
++		"/lib/firmware/$release" /lib/firmware; do
++		for radio in IPQ5018 QCN6122; do
++			file="$root/ath11k/$radio/hw1.0/board-2.bin"
++			[ ! -e "$file" ] && [ ! -L "$file" ] || return 1
++		done
++	done
++}
++
++ew30sx_wifi_rollback() {
++	local dir="$1" param="$2" attempted="$3" current
++
++	if [ "$attempted" = 1 ]; then
++		# Do not make a writable /tmp name available while the kernel
++		# may still search it. NUL sets the sysfs string to empty.
++		[ ! -L "$param" ] && current="$(cat "$param")" || return 1
++		if [ "$current" = "$dir" ]; then
++			printf '\000' >"$param" && current="$(cat "$param")" || return 1
++		fi
++		[ -z "$current" ] || return 1
++	fi
++	ew30sx_wifi_private "$dir" drwx------ && rm -rf "$dir"
++}
++
+ # Read WIFIFW directly with userspace XZ support and only the two ART slices.
+ # Do not mount or copy partitions, stage stock executables, or patch ART.
+ ew30sx_stage_wifi() (
+-	local art wififw dir fw ipq qcn ipq_cal qcn_cal path
++	local dir=/tmp/ew30sx-wifi marker=/tmp/ew30sx-wifi-ready
++	local param=/sys/module/firmware_class/parameters/path
++	local art wififw fw ipq qcn current attempted=0
++
++	fw="$dir/ath11k"
++	ipq="$fw/IPQ5018/hw1.0"
++	qcn="$fw/QCN6122/hw1.0"
++
++	# procd mounts /tmp as tmpfs with mode 01777 before this service.
++	[ ! -L /tmp ] && [ -O /tmp ] &&
++		awk '$2 == "/tmp" { tmpfs = ($3 == "tmpfs") } END { exit !tmpfs }' /proc/mounts ||
++		return 1
++	case "$(LC_ALL=C ls -ld /tmp)" in
++		'drwxrwxrwt '*|'drwxrwxrwt. '*|'drwxr-xr-x '*|'drwxr-xr-x. '*) ;;
++		*) return 1 ;;
++	esac
++
++	[ ! -L "$param" ] && [ -f "$param" ] && [ -w "$param" ] &&
++		current="$(cat "$param")" && ew30sx_wifi_check_api2 || return 1
++	if [ -e "$marker" ] || [ -L "$marker" ]; then
++		[ "$current" = "$dir" ] && ew30sx_wifi_ready "$dir" "$marker" "$ipq" "$qcn"
++		return $?
++	fi
++	[ -z "$current" ] && [ ! -e "$dir" ] && [ ! -L "$dir" ] || return 1
+ 
+-	[ -e /tmp/ew30sx-wifi-ready ] && return 0
+ 	art="$(ew30sx_mtd 0:ART 1769472 458752)" || return 1
+ 	wififw="$(ew30sx_mtd 0:WIFIFW 28442624 4194304)" || return 1
+ 	art="/dev/mtd${art}ro"
+@@ -84,38 +178,33 @@ ew30sx_stage_wifi() (
+ 	[ -c "$art" ] && [ -b "$wififw" ] || return 1
+ 
+ 	umask 077
+-	dir="$(mktemp -d /tmp/ew30sx-wifi.XXXXXX)" || return 1
+-	trap 'rm -f "$dir/bdf-2g" "$dir/bdf-5g" "$dir/cal-2g" "$dir/cal-5g"
+-		rmdir "$dir" 2>/dev/null' EXIT
+-
+-	ew30sx_extract_bdf "$wififw" bdwlan.b10 >"$dir/bdf-2g" 2>/dev/null &&
+-		ew30sx_prepare_bdf "$dir/bdf-2g" &&
+-		ew30sx_extract_bdf "$wififw" qcn6122/bdwlan.b60 >"$dir/bdf-5g" 2>/dev/null &&
+-		ew30sx_prepare_bdf "$dir/bdf-5g" ||
++	mkdir "$dir" || return 1
++	trap 'ew30sx_wifi_rollback "$dir" "$param" "$attempted"' EXIT
++	trap 'exit 1' HUP INT TERM
++	mkdir "$fw" "${ipq%/*}" "$ipq" "${qcn%/*}" "$qcn" || return 1
++
++	ew30sx_extract_bdf "$wififw" bdwlan.b10 >"$ipq/board.bin" 2>/dev/null &&
++		ew30sx_prepare_bdf "$ipq/board.bin" &&
++		ew30sx_extract_bdf "$wififw" qcn6122/bdwlan.b60 >"$qcn/board.bin" 2>/dev/null &&
++		ew30sx_prepare_bdf "$qcn/board.bin" ||
+ 		return 1
+ 
+-	dd if="$art" of="$dir/cal-2g" bs=2048 skip=2 count=64 2>/dev/null &&
+-		dd if="$art" of="$dir/cal-5g" bs=2048 skip=77 count=64 2>/dev/null &&
+-		ew30sx_check_blob "$dir/cal-2g" &&
+-		ew30sx_check_blob "$dir/cal-5g" ||
++	dd if="$art" of="$ipq/cal-ahb-c000000.wifi.bin" bs=2048 skip=2 count=64 2>/dev/null &&
++		dd if="$art" of="$qcn/cal-ahb-b00a040.wifi.bin" bs=2048 skip=77 count=64 2>/dev/null &&
++		ew30sx_check_blob "$ipq/cal-ahb-c000000.wifi.bin" &&
++		ew30sx_check_blob "$qcn/cal-ahb-b00a040.wifi.bin" ||
+ 		return 1
+ 
+-	fw=/lib/firmware/ath11k
+-	ipq="$fw/IPQ5018/hw1.0"
+-	qcn="$fw/QCN6122/hw1.0"
+-	ipq_cal="$ipq/cal-ahb-c000000.wifi.bin"
+-	qcn_cal="$qcn/cal-ahb-b00a040.wifi.bin"
+-	for path in "$ipq/board.bin" "$qcn/board.bin" "$ipq_cal" "$qcn_cal"; do
+-		[ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+-	done
++	# firmware_class is built in and searches this path before its
++	# default paths. Missing executable firmware still comes from
++	# /lib/firmware. The caller loads ath11k only after we succeed.
++	[ ! -L "$param" ] && current="$(cat "$param")" && [ -z "$current" ] || return 1
++	attempted=1
++	printf '%s' "$dir" >"$param" && current="$(cat "$param")" &&
++		[ "$current" = "$dir" ] || return 1
+ 
+-	if cp "$dir/bdf-2g" "$ipq/board.bin" &&
+-		cp "$dir/bdf-5g" "$qcn/board.bin" &&
+-		cp "$dir/cal-2g" "$ipq_cal" &&
+-		cp "$dir/cal-5g" "$qcn_cal" &&
+-		touch /tmp/ew30sx-wifi-ready; then
+-		return 0
+-	fi
+-	rm -f "$ipq/board.bin" "$qcn/board.bin" "$ipq_cal" "$qcn_cal" /tmp/ew30sx-wifi-ready
+-	return 1
++	# Atomic marker publication, after both radios and search path are ready.
++	trap '' HUP INT TERM
++	mkdir "$marker" || return 1
++	trap - EXIT
+ )
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh b/target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh
+index 1c8c377679..71e29342a8 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh
++++ b/target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh
+@@ -372,6 +372,10 @@ linksys_mx_pre_upgrade() {
+ 
+ platform_check_image() {
+ 	case "$(board_name)" in
++	vnpt,ew30sx)
++		echo "EW30SX: sysupgrade is not supported for the split NOR beta"
++		return 1
++		;;
+ 	cudy,p5|\
+ 	xiaomi,mi-router-ax3000t-v2)
+ 		nand_do_platform_check "$(board_name)" "$1"
+@@ -396,6 +400,10 @@ platform_pre_upgrade() {
+ 
+ platform_do_upgrade() {
+ 	case "$(board_name)" in
++	vnpt,ew30sx)
++		echo "EW30SX: refusing to write flash via sysupgrade"
++		return 1
++		;;
+ 	avm,fritzbox-4050)
+ 		sync
+ 		CI_KERNPART="fit0"

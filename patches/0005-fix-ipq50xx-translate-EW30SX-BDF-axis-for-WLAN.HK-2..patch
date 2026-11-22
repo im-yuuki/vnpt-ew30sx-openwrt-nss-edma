@@ -1,0 +1,76 @@
+From 96279e6b7d22e6fb919159dfa380fdb49132291f Mon Sep 17 00:00:00 2001
+From: Yuuki <me@june8th.eu.org>
+Date: Sun, 22 Nov 2026 10:04:51 +0700
+Subject: [PATCH 5/7] fix(ipq50xx): translate EW30SX BDF axis for WLAN.HK 2.7
+
+---
+ .../base-files/lib/functions/ew30sx-wifi.sh   | 47 +++++++++++++++++--
+ 1 file changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh b/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+index 830efcf91d..a7f777fbd4 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
++++ b/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+@@ -30,8 +30,49 @@ ew30sx_extract_bdf() (
+ 		-processors 1 -mem 8M "$1" "$2"
+ )
+ 
++# Validate the LE 16-bit XOR and return the axis and the two checksum bytes
++# for a zero axis (octal for BusyBox printf). Input size is checked separately.
++ew30sx_bdf_axis_checksum() (
++	set -o pipefail || return 1
++	hexdump -v -e '2/1 "%u " "\n"' "$1" | awk '
++		NF != 2 { bad = 1 }
++		{
++			word = $1 + 256 * $2
++			sum = xor(sum, word)
++		}
++		NR == 6 { checksum_lo = $1; checksum_hi = $2 }
++		NR == 559 { axis = word } # 0x45c / 2 + 1
++		NR == 560 && word != 0 { bad = 1 }
++		END {
++			if (bad || NR != 65536 || sum != 65535 || (axis != 0 && axis != 3))
++				exit 1
++			printf "%d %03o %03o\n", axis, xor(checksum_lo, axis), checksum_hi
++		}
++	'
++)
++
++ew30sx_prepare_bdf() {
++	local file="$1" info
++
++	[ "$(wc -c < "$file")" = 131072 ] &&
++		[ "$(hexdump -v -n 6 -e '1/1 "%02x"' "$file")" = 010004040000 ] ||
++		return 1
++	info="$(ew30sx_bdf_axis_checksum "$file")" || return 1
++	set -- $info
++	[ "$1" = 3 ] || return 0
++
++	# Stock BDFs use the old axis encoding (3). WLAN.HK.2.7.0.1 needs
++	# 0 here (ANTENNACHAIN_AXIS_Z), or phyrf_bdf.c:6245 asserts.
++	# Adjust only the axis and its checksum, in this private RAM copy.
++	printf '\000\000\000\000' |
++		dd of="$file" bs=1 seek=$((0x45c)) conv=notrunc 2>/dev/null &&
++		printf '%b' "\\0$2\\0$3" |
++		dd of="$file" bs=1 seek=$((0xa)) conv=notrunc 2>/dev/null &&
++		[ "$(ew30sx_bdf_axis_checksum "$file")" = "0 $2 $3" ]
++}
++
+ # Read WIFIFW directly with userspace XZ support and only the two ART slices.
+-# Do not mount or copy partitions, stage stock executables, or patch the bytes.
++# Do not mount or copy partitions, stage stock executables, or patch ART.
+ ew30sx_stage_wifi() (
+ 	local art wififw dir fw ipq qcn ipq_cal qcn_cal path
+ 
+@@ -48,9 +89,9 @@ ew30sx_stage_wifi() (
+ 		rmdir "$dir" 2>/dev/null' EXIT
+ 
+ 	ew30sx_extract_bdf "$wififw" bdwlan.b10 >"$dir/bdf-2g" 2>/dev/null &&
+-		ew30sx_check_blob "$dir/bdf-2g" &&
++		ew30sx_prepare_bdf "$dir/bdf-2g" &&
+ 		ew30sx_extract_bdf "$wififw" qcn6122/bdwlan.b60 >"$dir/bdf-5g" 2>/dev/null &&
+-		ew30sx_check_blob "$dir/bdf-5g" ||
++		ew30sx_prepare_bdf "$dir/bdf-5g" ||
+ 		return 1
+ 
+ 	dd if="$art" of="$dir/cal-2g" bs=2048 skip=2 count=64 2>/dev/null &&

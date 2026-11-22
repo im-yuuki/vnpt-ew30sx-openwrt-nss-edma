@@ -1,0 +1,446 @@
+From 9291224641bfa424620974d2f2924b670f9408c4 Mon Sep 17 00:00:00 2001
+From: Yuuki <me@june8th.eu.org>
+Date: Sun, 22 Nov 2026 09:46:15 +0700
+Subject: [PATCH 4/7] fix(ipq50xx): stage EW30SX Wi-Fi data and separate WAN
+ and LAN
+
+---
+ package/nss/nss-tools/files/nss-dwmac-up      | 45 ++++--------
+ .../nss/nss-tools/files/nss-dwmac.defaults    | 26 ++++---
+ package/nss/nss-tools/files/nss-dwmac.init    | 29 ++++----
+ .../qualcommax/dts/ipq5018-vnpt-ew30sx.dts    | 44 ++++++------
+ target/linux/qualcommax/image/ipq50xx.mk      |  1 +
+ .../ipq50xx/base-files/etc/board.d/02_network |  8 +--
+ .../base-files/lib/functions/ew30sx-wifi.sh   | 70 ++++++++++++-------
+ 7 files changed, 116 insertions(+), 107 deletions(-)
+
+diff --git a/package/nss/nss-tools/files/nss-dwmac-up b/package/nss/nss-tools/files/nss-dwmac-up
+index 271281b503..a30cdf9b83 100644
+--- a/package/nss/nss-tools/files/nss-dwmac-up
++++ b/package/nss/nss-tools/files/nss-dwmac-up
+@@ -5,6 +5,12 @@
+ # topology it builds on the trunk, and brings up connection acceleration.
+ set -e
+ . /lib/functions.sh
++
++if [ "$(board_name)" = "vnpt,ew30sx" ]; then
++  echo "EW30SX: NSS wired takeover is disabled; keeping the Linux host path"
++  exit 0
++fi
++
+ . /lib/nss/functions.sh
+ 
+ [ "$(readlink /sbin/modprobe)" = /sbin/kmodloader ] ||
+@@ -21,14 +27,6 @@ FWM=/sys/kernel/debug/qca-dwmac-nss/fw_mask
+ # before the arm and before ath11k - a board with no radios (measured, E287).
+ TOPOLOGY="$(uci -q get nss.general.topology)" || TOPOLOGY=''
+ TRUNK="$(uci -q get nss.general.trunk)" || TRUNK=''
+-EW30SX=0
+-ARM=1
+-if [ "$(board_name)" = "vnpt,ew30sx" ]; then
+-  EW30SX=1
+-  TOPOLOGY=''
+-  TRUNK="$(nss_gmac_netdevs | sed -n 's/^0://p')"
+-  [ -n "$TRUNK" ] || exit 1
+-fi
+ # C-3PO: the trunk is the DSA conduit, and the board says which netdev
+ # that is (nss.general.trunk overrides).
+ if [ -z "$TRUNK" ] && [ "$TOPOLOGY" = "dsa" ]; then
+@@ -52,21 +50,12 @@ fi
+ eth_up() {
+   [ "$(cat /sys/class/net/$TRUNK/operstate 2>/dev/null)" = "up" ]
+ }
+-arm_timeout() {
+-  if [ "$EW30SX" = 1 ]; then
+-    echo "EW30SX: $1; leaving GMAC0 on the host path"
+-    ARM=0
+-  else
+-    echo "WARN: $1, arming anyway"
+-  fi
+-}
+-
+-poll_until 30 eth_up || arm_timeout "$TRUNK not up after 30s"
++poll_until 30 eth_up || echo "WARN: $TRUNK not up after 30s, arming anyway"
+ 
+ lan_up() {
+   ubus call network.interface.lan status 2>/dev/null | grep -q '"up": true'
+ }
+-[ "$ARM" = 0 ] || poll_until 30 lan_up || arm_timeout "netifd lan not up after 30s"
++poll_until 30 lan_up || echo "WARN: netifd lan not up after 30s, arming anyway"
+ 
+ eth_promisc() {
+   [ $(( $(cat /sys/class/net/$TRUNK/flags 2>/dev/null || echo 0) & 0x100 )) -ne 0 ]
+@@ -76,17 +65,15 @@ eth_promisc() {
+ # the conduit's hardware VLAN filter and the user ports add their MACs.
+ if [ "$TOPOLOGY" = "dsa" ]; then
+   echo "topology dsa: $TRUNK is the DSA conduit (tagger $(cat /sys/class/net/$TRUNK/dsa/tagging 2>/dev/null))"
+-elif [ "$ARM" = 1 ]; then
+-  poll_until 15 eth_promisc || arm_timeout "$TRUNK not promiscuous after 15s"
++else
++  poll_until 15 eth_promisc || echo "WARN: $TRUNK not promiscuous after 15s, arming anyway"
+ fi
+ 
+ sleep 3
+ 
+-if [ "$ARM" = 1 ] && [ "$(cat $FWM 2>/dev/null)" = "0x0" ]; then
++if [ "$(cat $FWM 2>/dev/null)" = "0x0" ]; then
+   MASK="$(uci -q get nss.general.fw_mask)" || MASK=''
+-  if [ "$EW30SX" = 1 ]; then
+-    MASK=0x1
+-  elif [ -z "$MASK" ] && [ "$TOPOLOGY" = "dsa" ]; then
++  if [ -z "$MASK" ] && [ "$TOPOLOGY" = "dsa" ]; then
+     # C-3PO: netifd has run, so a GMAC that is up is one that is in use -
+     # the conduit and any WAN PHY of its own get armed, an unused GMAC or
+     # a second CPU port DSA does not use stay on the host.
+@@ -95,10 +82,7 @@ if [ "$ARM" = 1 ] && [ "$(cat $FWM 2>/dev/null)" = "0x0" ]; then
+     echo "topology dsa: fw_mask $MASK from the board (conduit ${NSS_CONDUIT:-none} = phys_if ${NSS_CONDUIT_IF:--}, GMACs $(nss_gmac_netdevs | tr '\n' ' '))"
+   fi
+   [ -n "$MASK" ] || MASK=0x2
+-  if ! (echo "$MASK" > $FWM) 2>/dev/null; then
+-    [ "$EW30SX" = 1 ] || exit 1
+-    ARM=0
+-  fi
++  (echo "$MASK" > $FWM) 2>/dev/null || exit 1
+ fi
+ 
+ # Wi-Fi offload is loaded from here, not from the service, because ath11k
+@@ -144,7 +128,6 @@ wifi_load_now() {
+   local offload="$1"
+ 
+   [ "$WIFI_OFFLOAD" = "1" ] || return 0        # the service already loaded it
+-  [ "$EW30SX" = 0 ] || [ -e /tmp/ew30sx-wifi-ready ] || return 0
+   grep -q '^ath11k_ahb ' /proc/modules && return 0  # someone got there first
+   # NB: the guard is on ath11k_ahb, not ath11k - the core module may be in
+   # already (a service restart, or a build without this package); it is the
+@@ -281,7 +264,7 @@ wifi_sync_netifd() {
+ }
+ 
+ fw_started() { grep -q started $GLUE_STATUS 2>/dev/null; }
+-if [ "$ARM" = 0 ] || ! poll_until 15 fw_started; then
++if ! poll_until 15 fw_started; then
+   echo "firmware takeover failed - staying on the host data path (same topology)"
+   wifi_load_now 0
+   wifi_sync_netifd
+diff --git a/package/nss/nss-tools/files/nss-dwmac.defaults b/package/nss/nss-tools/files/nss-dwmac.defaults
+index 7b4a500b99..2d9255d501 100644
+--- a/package/nss/nss-tools/files/nss-dwmac.defaults
++++ b/package/nss/nss-tools/files/nss-dwmac.defaults
+@@ -317,6 +317,21 @@ nss_dwmac_board_defaults() {
+ 	esac
+ }
+ 
++board="$(board_name)"
++if [ "$board" = "vnpt,ew30sx" ]; then
++	# Board.d already separates WAN PHY and DSA LAN. Neither the DSA
++	# offload defaults nor the VLAN-trunk migration applies.
++	[ -x /etc/init.d/qca-nss-drv ] && /etc/init.d/qca-nss-drv disable
++	uci -q batch <<-EOF
++		set nss.general.topology='dsa'
++		set nss.general.enabled='0'
++		set nss.general.wifi_offload='0'
++		set nss.general.fw_mask='0x0'
++		commit nss
++	EOF
++	exit $?
++fi
++
+ [ -n "$(uci -q get nss.general.topology)" ] && exit 0
+ 
+ # C-3PO: a board whose switch is driven by qca8k, rtl8365mb or an8855 gets the dsa
+@@ -379,17 +394,6 @@ if c3po_switch_bound; then
+ 	exit 0
+ fi
+ 
+-board="$(board_name)"
+-if [ "$board" = "vnpt,ew30sx" ]; then
+-	# GMAC0 is the only enabled MAC. The external fabric and GMAC1
+-	# are deliberately not used by the RAM-only diagnostic image.
+-	uci -q batch <<-EOF
+-		set nss.general.fabric='none'
+-		set nss.general.trunk='eth0'
+-		set nss.general.trunk_if='0'
+-		set nss.general.fw_mask='0x1'
+-	EOF
+-fi
+ known_board=1
+ if ! nss_dwmac_board_defaults "$board"; then
+ 	known_board=0
+diff --git a/package/nss/nss-tools/files/nss-dwmac.init b/package/nss/nss-tools/files/nss-dwmac.init
+index cbe4a48a22..d92d5f1aa2 100644
+--- a/package/nss/nss-tools/files/nss-dwmac.init
++++ b/package/nss/nss-tools/files/nss-dwmac.init
+@@ -220,21 +220,25 @@ switch_to_8021q() {
+ }
+ 
+ start_service() {
+-	local mask wifi_offload topology board ifmap
++	local wifi_offload topology ifmap
+ 
+-	. /lib/nss/functions.sh
+-
+-	board="$(board_name)"
+-	topology="$(uci -q get nss.general.topology)"
+-	if [ "$board" = "vnpt,ew30sx" ]; then
++	# Keep both Ethernet MACs on stmmac and the switch on native qca8k.
++	if [ "$(board_name)" = "vnpt,ew30sx" ]; then
+ 		. /lib/functions/ew30sx-wifi.sh
+ 		if ew30sx_stage_wifi; then
+ 			logger -t nss "EW30SX: factory data staged in RAM for both radios"
++			wifi_load 0
+ 		else
+ 			logger -p user.err -t nss "EW30SX: factory data unavailable or invalid; not loading ath11k"
+ 		fi
+-		# Never reconfigure the external switch on this board.
+-	elif [ "$topology" = "dsa" ]; then
++		logger -t nss "EW30SX: keeping WAN and DSA LAN on the Linux host path"
++		return 0
++	fi
++
++	. /lib/nss/functions.sh
++
++	topology="$(uci -q get nss.general.topology)"
++	if [ "$topology" = "dsa" ]; then
+ 		switch_to_8021q
+ 	elif ! switch_to_trunk; then
+ 		logger -p user.err -t nss "switch setup failed; refusing NSS takeover"
+@@ -282,14 +286,7 @@ start_service() {
+ 	trunk="$(uci -q get nss.general.trunk)"
+ 	trunk_if="$(uci -q get nss.general.trunk_if)"
+ 	extra="$(uci -q get nss.general.extra_ports | tr ' ' ',')"
+-	if [ "$board" = "vnpt,ew30sx" ]; then
+-		ifmap="$(nss_gmac_netdevs | grep '^0:')"
+-		if [ -z "$ifmap" ]; then
+-			logger -p user.err -t nss "EW30SX: no GMAC0 netdev; not arming NSS"
+-			wifi_load 0
+-			return 0
+-		fi
+-	elif [ "$topology" = "dsa" ] && [ -z "$trunk$trunk_if$extra" ]; then
++	if [ "$topology" = "dsa" ] && [ -z "$trunk$trunk_if$extra" ]; then
+ 		# C-3PO: every GMAC that has a netdev, by the node it sits on.
+ 		# Which of them the firmware gets is nss-dwmac-up's call, once
+ 		# netifd has said which ones are in use (nss_dsa_fw_mask).
+diff --git a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
+index d6ec26af6b..bf0b3f32d6 100644
+--- a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
++++ b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
+@@ -164,14 +164,22 @@
+ 	status = "okay";
+ };
+ 
+-/* GMAC0's built-in PHY is confirmed; do not assign a jack label yet. */
++&uniphy0 {
++	assigned-clocks = <&uniphy0 UNIPHY_CLK_REF>;
++	assigned-clock-rates = <UNIPHY_REFCLK_25MHZ>;
++	status = "okay";
++};
++
++/* GMAC0 -> MDIO0 GE PHY7 -> WAN jack */
+ &gmac0 {
++	label = "wan";
+ 	status = "okay";
+ };
+ 
++/* GMAC1 -> UNIPHY SGMII -> AR8337 CPU port 6 */
+ &gmac1 {
+ 	phy-mode = "sgmii";
+-	status = "disabled";
++	status = "okay";
+ 
+ 	fixed-link {
+ 		speed = <1000>;
+@@ -183,45 +191,39 @@
+ 	status = "okay";
+ };
+ 
+-/* Probe PHY IDs without driving GPIO26 (the stock switch reset). */
+ &mdio1 {
+ 	pinctrl-0 = <&mdio1_pins>;
+ 	pinctrl-names = "default";
++	/* Reset the switch before enumerating its PHY; match stock's 200 ms pulse. */
++	reset-gpios = <&tlmm 26 GPIO_ACTIVE_LOW>;
++	reset-delay-us = <200000>;
++	reset-post-delay-us = <100000>;
+ 	status = "okay";
+ 
+-	ethernet-phy@0 {
+-		reg = <0>;
+-	};
+-
+-	ethernet-phy@1 {
+-		reg = <1>;
+-	};
+-
+-	ethernet-phy@2 {
++	lan_phy: ethernet-phy@2 {
+ 		reg = <2>;
+ 	};
+ 
+-	ethernet-phy@3 {
+-		reg = <3>;
+-	};
+-
+-	/*
+-	 * Use the usual qca8k management address and the stock DT's CPU6
+-	 * candidate. Keep the fabric disabled until both are validated.
+-	 */
++	/* Use the conventional qca8k MDIO address, as on the Redmi AX5400. */
+ 	ethernet-switch@11 {
+ 		compatible = "qca,qca8337";
+ 		reg = <0x11>;
+-		status = "disabled";
+ 
+ 		ethernet-ports {
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+ 
++			ethernet-port@3 {
++				reg = <3>;
++				label = "lan";
++				phy-handle = <&lan_phy>;
++			};
++
+ 			ethernet-port@6 {
+ 				reg = <6>;
+ 				ethernet = <&gmac1>;
+ 				phy-mode = "sgmii";
++				qca,sgmii-enable-pll;
+ 
+ 				fixed-link {
+ 					speed = <1000>;
+diff --git a/target/linux/qualcommax/image/ipq50xx.mk b/target/linux/qualcommax/image/ipq50xx.mk
+index 532a5c19d4..b11a043181 100644
+--- a/target/linux/qualcommax/image/ipq50xx.mk
++++ b/target/linux/qualcommax/image/ipq50xx.mk
+@@ -808,6 +808,7 @@ define Device/vnpt_ew30sx
+ 	KERNEL_INITRAMFS := kernel-bin | libdeflate-gzip | fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd
+ 	DEVICE_PACKAGES := ath11k-firmware-ipq5018-qcn6122 \
+ 		nss-tools-dwmac \
++		squashfs-tools-unsquashfs \
+ 		ip-full \
+ 		iperf3
+ endef
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
+index 401cf9a245..94731bcc4f 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
++++ b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
+@@ -7,10 +7,6 @@ ipq50xx_setup_interfaces()
+ {
+ 	local board="$1"
+ 	case $board in
+-	vnpt,ew30sx)
+-		# GMAC0 is an isolated bench management port in the RAM image.
+-		ucidef_set_interface_lan "eth0"
+-		;;
+ 	elecom,wrc-x3000gs2|\
+ 	elecom,wrc-x3000gst2|\
+ 	iodata,wn-dax3000gr|\
+@@ -35,6 +31,10 @@ ipq50xx_setup_interfaces()
+ 	glinet,gl-x2000)
+ 		ucidef_set_interfaces_lan_wan "lan" "wan"
+ 		;;
++	vnpt,ew30sx)
++		# DSA names the LAN port; preinit names GMAC0 from its DT label.
++		ucidef_set_interfaces_lan_wan "lan" "wan"
++		;;
+ 	avm,fritzbox-4050|\
+ 	cmcc,mr3000d-ci|\
+ 	cmcc,rax3000q|\
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh b/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+index aa2aae1628..830efcf91d 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
++++ b/target/linux/qualcommax/ipq50xx/base-files/lib/functions/ew30sx-wifi.sh
+@@ -10,7 +10,9 @@ ew30sx_mtd() {
+ 	[ "$(cat "$dev/offset")" = "$2" ] || return 1
+ 	[ "$(cat "$dev/size")" = "$3" ] || return 1
+ 	flags="$(cat "$dev/flags")" || return 1
+-	[ $((flags & 0x400)) -eq 0 ] || return 1
++	case "$flags" in 0x*) flags="${flags#0x}" ;; *) return 1 ;; esac
++	case "$flags" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
++	[ "$((0x$flags & 0x400))" -eq 0 ] || return 1
+ 	echo "$id"
+ }
+ 
+@@ -19,40 +21,60 @@ ew30sx_check_blob() {
+ 		[ "$(tr -d '\000\377' < "$1" | wc -c)" -gt 0 ]
+ }
+ 
+-# The stock MP02 script reads raw 128 KiB slices from ART. Stock's BDFs
+-# are separate files in the WIFIFW SquashFS. Do not keep a copy of ART,
+-# use stock executable firmware, or patch the factory bytes.
++ew30sx_extract_bdf() (
++	# Bound output to 128 KiB (512-byte blocks) and cap total address space
++	# separately from the extractor's decompression caches.
++	ulimit -c 0 && ulimit -f 256 && ulimit -v 98304 || return 1
++	unset PAGER SQFS_CMDLINE
++	exec /usr/sbin/unsquashfs -cat -no-wildcards -strict-errors \
++		-processors 1 -mem 8M "$1" "$2"
++)
++
++# Read WIFIFW directly with userspace XZ support and only the two ART slices.
++# Do not mount or copy partitions, stage stock executables, or patch the bytes.
+ ew30sx_stage_wifi() (
+-	local art wififw dir fw
++	local art wififw dir fw ipq qcn ipq_cal qcn_cal path
+ 
+ 	[ -e /tmp/ew30sx-wifi-ready ] && return 0
+ 	art="$(ew30sx_mtd 0:ART 1769472 458752)" || return 1
+ 	wififw="$(ew30sx_mtd 0:WIFIFW 28442624 4194304)" || return 1
+-	[ -c "/dev/mtd${art}ro" ] && [ -b "/dev/mtdblock$wififw" ] || return 1
++	art="/dev/mtd${art}ro"
++	wififw="/dev/mtdblock$wififw"
++	[ -c "$art" ] && [ -b "$wififw" ] || return 1
+ 
+ 	umask 077
+ 	dir="$(mktemp -d /tmp/ew30sx-wifi.XXXXXX)" || return 1
+-	mkdir "$dir/stock" || { rmdir "$dir"; return 1; }
+-	trap 'umount "$dir/stock" 2>/dev/null
+-		rm -f "$dir/bdf-2g" "$dir/bdf-5g" "$dir/cal-2g" "$dir/cal-5g"
+-		rmdir "$dir/stock" "$dir" 2>/dev/null' EXIT
+-	mount -t squashfs -o ro,nodev,nosuid,noexec "/dev/mtdblock$wififw" "$dir/stock" ||
++	trap 'rm -f "$dir/bdf-2g" "$dir/bdf-5g" "$dir/cal-2g" "$dir/cal-5g"
++		rmdir "$dir" 2>/dev/null' EXIT
++
++	ew30sx_extract_bdf "$wififw" bdwlan.b10 >"$dir/bdf-2g" 2>/dev/null &&
++		ew30sx_check_blob "$dir/bdf-2g" &&
++		ew30sx_extract_bdf "$wififw" qcn6122/bdwlan.b60 >"$dir/bdf-5g" 2>/dev/null &&
++		ew30sx_check_blob "$dir/bdf-5g" ||
+ 		return 1
+ 
+-	cp "$dir/stock/bdwlan.b10" "$dir/bdf-2g" &&
+-		cp "$dir/stock/qcn6122/bdwlan.b90" "$dir/bdf-5g" &&
+-		dd if="/dev/mtd${art}ro" of="$dir/cal-2g" bs=2048 skip=2 count=64 2>/dev/null &&
+-		dd if="/dev/mtd${art}ro" of="$dir/cal-5g" bs=2048 skip=77 count=64 2>/dev/null ||
++	dd if="$art" of="$dir/cal-2g" bs=2048 skip=2 count=64 2>/dev/null &&
++		dd if="$art" of="$dir/cal-5g" bs=2048 skip=77 count=64 2>/dev/null &&
++		ew30sx_check_blob "$dir/cal-2g" &&
++		ew30sx_check_blob "$dir/cal-5g" ||
+ 		return 1
+-	umount "$dir/stock" || return 1
+-	for fw in bdf-2g bdf-5g cal-2g cal-5g; do
+-		ew30sx_check_blob "$dir/$fw" || return 1
+-	done
+ 
+ 	fw=/lib/firmware/ath11k
+-	cp "$dir/bdf-2g" "$fw/IPQ5018/hw1.0/board.bin" &&
+-		cp "$dir/bdf-5g" "$fw/QCN6122/hw1.0/board.bin" &&
+-		cp "$dir/cal-2g" "$fw/IPQ5018/hw1.0/cal-ahb-c000000.wifi.bin" &&
+-		cp "$dir/cal-5g" "$fw/QCN6122/hw1.0/cal-ahb-b00a040.wifi.bin" &&
+-		touch /tmp/ew30sx-wifi-ready
++	ipq="$fw/IPQ5018/hw1.0"
++	qcn="$fw/QCN6122/hw1.0"
++	ipq_cal="$ipq/cal-ahb-c000000.wifi.bin"
++	qcn_cal="$qcn/cal-ahb-b00a040.wifi.bin"
++	for path in "$ipq/board.bin" "$qcn/board.bin" "$ipq_cal" "$qcn_cal"; do
++		[ ! -e "$path" ] && [ ! -L "$path" ] || return 1
++	done
++
++	if cp "$dir/bdf-2g" "$ipq/board.bin" &&
++		cp "$dir/bdf-5g" "$qcn/board.bin" &&
++		cp "$dir/cal-2g" "$ipq_cal" &&
++		cp "$dir/cal-5g" "$qcn_cal" &&
++		touch /tmp/ew30sx-wifi-ready; then
++		return 0
++	fi
++	rm -f "$ipq/board.bin" "$qcn/board.bin" "$ipq_cal" "$qcn_cal" /tmp/ew30sx-wifi-ready
++	return 1
+ )

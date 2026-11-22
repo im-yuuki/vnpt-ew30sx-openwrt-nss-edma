@@ -1,0 +1,2 @@
+# Do not use generic rolling OpenWrt package indexes with this custom firmware.
+# GitHub Actions adds the signed APK feeds for this exact build if Pages is selected.

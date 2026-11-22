@@ -1,0 +1,102 @@
+From 9d037fd6957f6710c11bf6bc9cba5e99287ca6d5 Mon Sep 17 00:00:00 2001
+From: Yuuki <me@june8th.eu.org>
+Date: Sun, 22 Nov 2026 16:45:09 +0700
+Subject: [PATCH 7/7] feat(ipq50xx): refine EW30SX router defaults
+
+---
+ target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts | 13 +++++++++++--
+ target/linux/qualcommax/image/ipq50xx.mk            |  6 +++++-
+ .../ipq50xx/base-files/etc/board.d/01_leds          |  3 +++
+ 3 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
+index bf0b3f32d6..341bc4ce95 100644
+--- a/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
++++ b/target/linux/qualcommax/dts/ipq5018-vnpt-ew30sx.dts
+@@ -16,6 +16,9 @@
+ 	compatible = "vnpt,ew30sx", "qcom,ipq5018";
+ 
+ 	aliases {
++		led-boot = &led_status_green;
++		led-failsafe = &led_status_red;
++		led-running = &led_status_green;
+ 		serial0 = &blsp1_uart1;
+ 	};
+ 
+@@ -85,13 +88,13 @@
+ 			function = LED_FUNCTION_WAN;
+ 		};
+ 
+-		led-system-red {
++		led_status_red: led-system-red {
+ 			gpios = <&tlmm 5 GPIO_ACTIVE_LOW>;
+ 			color = <LED_COLOR_ID_RED>;
+ 			function = LED_FUNCTION_STATUS;
+ 		};
+ 
+-		led-system-green {
++		led_status_green: led-system-green {
+ 			gpios = <&tlmm 6 GPIO_ACTIVE_LOW>;
+ 			color = <LED_COLOR_ID_GREEN>;
+ 			function = LED_FUNCTION_STATUS;
+@@ -100,10 +103,16 @@
+ 		led-wifi {
+ 			gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
+ 			function = LED_FUNCTION_WLAN;
++			linux,default-trigger = "phy0tpt";
+ 		};
+ 	};
+ };
+ 
++/* Keep the rated IPQ5018 operating point, not the fork's overclock. */
++&cpu_opp_table {
++	/delete-node/ opp-1296000000;
++};
++
+ &sleep_clk {
+ 	clock-frequency = <32000>;
+ };
+diff --git a/target/linux/qualcommax/image/ipq50xx.mk b/target/linux/qualcommax/image/ipq50xx.mk
+index ccc05732a1..f2bafdb0bd 100644
+--- a/target/linux/qualcommax/image/ipq50xx.mk
++++ b/target/linux/qualcommax/image/ipq50xx.mk
+@@ -807,13 +807,15 @@ define Device/vnpt_ew30sx-common
+ 		nss-tools-dwmac \
+ 		squashfs-tools-unsquashfs \
+ 		ip-full \
+-		iperf3
++		-kmod-usb3 -kmod-usb-dwc3 -kmod-usb-dwc3-qcom \
++		-e2fsprogs -kmod-fs-ext4 -losetup -uboot-envtools
+ endef
+ 
+ define Device/vnpt_ew30sx
+ 	$(call Device/vnpt_ew30sx-common)
+ 	$(call Device/FitImage)
+ 	DEVICE_DTS := ipq5018-vnpt-ew30sx
++	DEVICE_PACKAGES += iperf3
+ 	IMAGES :=
+ 	KERNEL_INITRAMFS := kernel-bin | libdeflate-gzip | fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd
+ endef
+@@ -824,6 +826,8 @@ define Device/vnpt_ew30sx-nor
+ 	$(call Device/FitImageLzma)
+ 	DEVICE_VARIANT := NOR beta
+ 	DEVICE_DTS := ipq5018-vnpt-ew30sx-nor
++	# Full wpad provides opt-in WPS and 802.11s; the basic variant does not.
++	DEVICE_PACKAGES += -wpad-basic-mbedtls wpad-mbedtls
+ 	BLOCKSIZE := 64k
+ 	KERNEL_SIZE := 5120k
+ 	KERNEL_INITRAMFS :=
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
+index dfb3612f8b..6f68431cfd 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
++++ b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
+@@ -31,6 +31,9 @@ h3c,magic-bx54-eu)
+ 	ucidef_set_led_netdev "wlan2g" "WLAN2G" "blue:wlan-2ghz" "phy0-ap0" "link tx rx"
+ 	ucidef_set_led_netdev "wlan5g" "WLAN5G" "blue:wlan-5ghz" "phy1-ap0" "link tx rx"
+ 	;;
++vnpt,ew30sx)
++	ucidef_set_led_netdev "wan" "WAN" "green:wan" "wan" "link tx rx"
++	;;
+ linksys,mr5500)
+ 	ucidef_set_led_netdev "lan1-port-link" "LAN1-PORT-LINK" "90000.mdio-1:00:green:lan" "lan1" "link_10 link_100 link_1000"
+ 	ucidef_set_led_netdev "lan1-port-activity" "LAN1-PORT-ACTIVITY" "90000.mdio-1:00:amber:lan" "lan1" "tx rx"

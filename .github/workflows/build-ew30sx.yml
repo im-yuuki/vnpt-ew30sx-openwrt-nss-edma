@@ -1,0 +1,266 @@
+name: Build EW30SX firmware + signed APK feeds
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_pages:
+        description: Publish this run's signed APK feeds on GitHub Pages (replaces the previous deployment)
+        type: boolean
+        default: false
+      publish_release:
+        description: Publish a GitHub prerelease with both image profiles and their feeds
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-ew30sx
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PAGES_BASE: ${{ vars.EW30SX_PAGES_URL || format('https://{0}.github.io/{1}', github.repository_owner, github.event.repository.name) }}
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+      upstream: ${{ steps.upstream.outputs.commit }}
+      gitmodules: ${{ steps.upstream.outputs.gitmodules }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: tag
+        run: echo "value=ew30sx-$(date -u +%Y.%m.%d)-${GITHUB_RUN_NUMBER}-a${GITHUB_RUN_ATTEMPT}" >>"$GITHUB_OUTPUT"
+      - name: Resolve the latest upstream tip for both profiles
+        id: upstream
+        run: |
+          set -euo pipefail
+          url=$(git config -f .gitmodules --get submodule.openwrt-nss-edma.url)
+          branch=$(git config -f .gitmodules --get submodule.openwrt-nss-edma.branch)
+          commit=$(git ls-remote --exit-code "$url" "refs/heads/$branch" | cut -f1)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+          echo "gitmodules=$(git rev-parse HEAD:.gitmodules)" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: metadata
+    name: Build ${{ matrix.flavor }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [nor, ram]
+    env:
+      FLAVOR: ${{ matrix.flavor }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+      UPSTREAM_COMMIT: ${{ needs.metadata.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          free=$(df -PB1 "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')
+          if (( free < 40 * 1024 * 1024 * 1024 )); then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          fi
+          df -hT "$GITHUB_WORKSPACE"
+          sudo apt-get update
+          sudo apt-get install -y build-essential bzip2 file flex gawk gettext git \
+            glibc-source libelf-dev libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync unzip wget zlib1g-dev
+
+      - name: Check out latest OpenWrt and apply EW30SX patches
+        run: |
+          set -euo pipefail
+          git submodule update --init -- openwrt-nss-edma
+          if ! git -C openwrt-nss-edma cat-file -e "$UPSTREAM_COMMIT^{commit}" 2>/dev/null; then
+            git -C openwrt-nss-edma fetch --no-tags origin "$UPSTREAM_COMMIT"
+          fi
+          git -C openwrt-nss-edma switch --detach "$UPSTREAM_COMMIT"
+          for patch in "$PWD"/patches/*.patch; do
+            git -C openwrt-nss-edma apply --index "$patch" ||
+              git -C openwrt-nss-edma apply --3way "$patch" || {
+                echo "::error::EW30SX patch ${patch##*/} no longer applies to $UPSTREAM_COMMIT"
+                exit 1
+              }
+          done
+          git submodule status
+
+      - name: Configure firmware
+        env:
+          PUBLISH_PAGES: ${{ inputs.publish_pages }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_PAGES" == true ]]; then
+            export FEED_URL="${PAGES_BASE%/}/$TAG/$FLAVOR/apk"
+          fi
+          bash .github/ci/configure.sh "$FLAVOR"
+
+      - name: Cache source archives and compilation
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt-nss-edma/dl
+            openwrt-nss-edma/.ccache
+          key: ew30sx-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.flavor }}-${{ env.UPSTREAM_COMMIT }}-${{ github.sha }}
+          restore-keys: ew30sx-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.flavor }}-
+
+      - name: Download sources
+        working-directory: openwrt-nss-edma
+        timeout-minutes: 75
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+          GIT_HTTP_LOW_SPEED_TIME: '60'
+          CURL_OPTIONS: --speed-limit 1000 --speed-time 60
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if timeout --kill-after=60 20m make download -j"$(nproc)"; then exit 0; fi
+            echo "::warning::source download attempt $attempt failed"
+          done
+          exit 1
+
+      - name: Build firmware and index APK repositories
+        working-directory: openwrt-nss-edma
+        env:
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 4G
+        run: |
+          set -euo pipefail
+          if ! make -j"$(nproc)"; then
+            make -j1 V=s 2>&1 | tail -300
+            exit 1
+          fi
+          make package/index
+          bash ../.github/ci/collect.sh "$FLAVOR" "../out/$FLAVOR"
+
+      - name: Upload firmware and matching signed APK feeds
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAG }}-${{ matrix.flavor }}
+          path: out/${{ matrix.flavor }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  update_submodule:
+    name: Record successful upstream revision
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      UPSTREAM_COMMIT: ${{ needs.metadata.outputs.upstream }}
+      BUILT_GITMODULES: ${{ needs.metadata.outputs.gitmodules }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/heads/${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - name: Advance the gitlink without overwriting newer commits
+        run: |
+          set -euo pipefail
+          submodule=openwrt-nss-edma
+          current=$(git rev-parse "HEAD:$submodule")
+          if [[ "$current" == "$UPSTREAM_COMMIT" ]]; then exit 0; fi
+          if [[ "$(git rev-parse HEAD:.gitmodules)" != "$BUILT_GITMODULES" ]] ||
+             ! git diff --quiet "$GITHUB_SHA" HEAD -- patches overlay .github; then
+            echo "::error::build inputs changed on $DEFAULT_BRANCH; run CI again"
+            exit 1
+          fi
+
+          # Inspect upstream commit history, but never execute its code in this write-enabled job.
+          url=$(git config -f .gitmodules --get "submodule.$submodule.url")
+          branch=$(git config -f .gitmodules --get "submodule.$submodule.branch")
+          history=$(mktemp -d "$RUNNER_TEMP/openwrt-gitlink.XXXXXX")
+          git clone --bare --filter=blob:none --single-branch --branch "$branch" "$url" "$history"
+          git -C "$history" merge-base --is-ancestor "$UPSTREAM_COMMIT" "refs/heads/$branch"
+          if git -C "$history" merge-base --is-ancestor "$UPSTREAM_COMMIT" "$current"; then exit 0; fi
+          git -C "$history" merge-base --is-ancestor "$current" "$UPSTREAM_COMMIT"
+
+          git update-index --cacheinfo "160000,$UPSTREAM_COMMIT,$submodule"
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "chore: update OpenWrt submodule to ${UPSTREAM_COMMIT:0:12}"
+          git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+
+  publish:
+    name: Publish APK feeds to GitHub Pages
+    if: inputs.publish_pages
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      TAG: ${{ needs.metadata.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.TAG }}-nor
+          path: site/${{ env.TAG }}/nor
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.TAG }}-ram
+          path: site/${{ env.TAG }}/ram
+      - name: Prepare Pages site
+        run: |
+          printf '<!doctype html><meta charset="utf-8"><title>EW30SX OpenWrt</title><h1>EW30SX OpenWrt</h1><p>APK feeds for build %s. Use only with images from the same run.</p><p><a href="%s/%s/actions/runs/%s">Firmware and APK archives</a></p>\n' \
+            "$TAG" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  release:
+    name: Publish GitHub prerelease
+    if: ${{ !cancelled() && inputs.publish_release && needs.build.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    needs: [metadata, build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.TAG }}-nor
+          path: dist/nor
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.TAG }}-ram
+          path: dist/ram
+      - name: Archive and publish both profiles
+        run: |
+          set -euo pipefail
+          for flavor in nor ram; do
+            tar -czf "$TAG-$flavor-firmware.tar.gz" -C "dist/$flavor/firmware" .
+            tar -czf "$TAG-$flavor-apk.tar.gz" -C "dist/$flavor/apk" .
+          done
+          sha256sum -- "$TAG"-*.tar.gz >sha256sums
+          printf '%s\n' \
+            'EW30SX experimental build. The split NOR pair is not a factory or sysupgrade image.' \
+            'Never flash the RAM FIT. Keep each profile with its own signed APK feeds.' \
+            "Build log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >release-notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "EW30SX OpenWrt $TAG" --prerelease --notes-file release-notes.md \
+            "$TAG"-*.tar.gz sha256sums
