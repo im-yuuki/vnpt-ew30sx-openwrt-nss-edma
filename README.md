@@ -11,8 +11,10 @@ và cập nhật các feed mà upstream khai báo.
 | `ram` | Initramfs FIT | Khởi động tạm qua UART/TFTP để chẩn đoán; **không ghi FIT này vào flash**. |
 
 NOR beta trước refactor đã boot từ U-Boot gốc, truy cập được qua LAN và
-nhận cả hai radio. Cấu hình mới chưa được thử trên thiết bị. Wi-Fi và
-WPS không tự bật; NSS offload vẫn tắt, Ethernet đi qua Linux/DSA.
+nhận cả hai radio. Cấu hình mới chưa được thử trên thiết bị. Mặc định bật
+cả hai AP (SSID `EW30SX-xxxx`, khóa WPA sinh riêng cho từng máy, lưu trong
+`/etc/config/wireless`) và NSS offload; WPS không bật. Chỉ bật Wi-Fi khi
+dữ liệu hiệu chuẩn nạp thành công.
 Không có ảnh cài qua web gốc hay `sysupgrade`; không ép nâng cấp.
 Xem [ghi chú phần cứng và giới hạn](docs/ew30sx-ram-boot.md).
 

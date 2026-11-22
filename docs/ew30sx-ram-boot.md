@@ -4,7 +4,10 @@ The board observations below are from the pre-refactor images. The wrapper
 keeps the same partition boundaries and calibration path while CI follows
 the configured upstream branch. The NOR build adds HTTPS LuCI, full
 `wpad` for optional WPS/802.11s, and keeps
-the normal OpenWrt router packages. Neither AP nor WPS is enabled by default.
+the normal OpenWrt router packages. Both APs and wired plus Wi-Fi NSS
+offload are on by default; WPS stays off. The AP key is generated on each
+router and kept in `/etc/config/wireless`. Both APs and the NSS path still
+need on-device validation.
 The shared board DTS stays at the rated 1008 MHz; it maps the system LEDs to
 boot/running/failsafe, the green WAN LED to link/activity, and the Wi-Fi LED
 to activity on the first registered PHY.
