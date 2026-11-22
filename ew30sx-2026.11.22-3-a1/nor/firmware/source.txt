@@ -1,0 +1,3 @@
+wrapper=c827063cab4f6b8c435aa93c95bb948f04b5ea65
+openwrt=092adebb06a2449287ad095a5d338c942f51d879
+profile=nor
