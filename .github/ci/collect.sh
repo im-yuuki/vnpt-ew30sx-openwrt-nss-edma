@@ -7,7 +7,9 @@ dest=${2:?Pass the output directory}
 target=bin/targets/qualcommax/ipq50xx
 feeds=bin/packages/aarch64_cortex-a53
 prefix=openwrt-qualcommax-ipq50xx-vnpt_ew30sx
-required=(apk-mbedtls dnsmasq dropbear firewall4 nftables odhcp6c odhcpd-ipv6only
+# firewall4 requires the concrete nftables-json package. nftables is just
+# the name provided by that package, not a manifest entry.
+required=(apk-mbedtls dnsmasq dropbear firewall4 nftables-json odhcp6c odhcpd-ipv6only
 	ppp-mod-pppoe kmod-ath11k-ahb kmod-gpio-button-hotplug kmod-leds-gpio
 	ath11k-firmware-ipq5018-qcn6122 nss-tools-dwmac nss-firmware-ipq50xx
 	squashfs-tools-unsquashfs)
@@ -53,7 +55,8 @@ staging_dir/host/bin/apk --root "${roots[0]}" --no-logfile \
 	list --quiet --manifest --no-network --repositories-file /dev/null |
 	sort | sed 's/ / - /' >"$manifest"
 for pkg in "${required[@]}"; do
-	grep -q "^$pkg - " "$manifest" || { echo "::error::missing image package: $pkg"; exit 1; }
+	awk -v pkg="$pkg" '$1 == pkg && $2 == "-" { found = 1 } END { exit !found }' "$manifest" ||
+		{ echo "::error::missing image package: $pkg"; exit 1; }
 done
 if [[ "$flavor" == nor ]] && grep -q '^wpad-basic-mbedtls - ' "$manifest"; then
 	echo "::error::the NOR image must not contain the basic wpad variant"
