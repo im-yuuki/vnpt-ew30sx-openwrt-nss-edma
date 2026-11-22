@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_pages:
-        description: Publish this run's signed APK feeds on GitHub Pages (replaces the previous deployment)
+        description: Publish firmware and signed APK feeds on GitHub Pages (keep the latest three builds)
         type: boolean
         default: false
       publish_release:
@@ -30,6 +30,11 @@ jobs:
       upstream: ${{ steps.upstream.outputs.commit }}
       gitmodules: ${{ steps.upstream.outputs.gitmodules }}
     steps:
+      - name: Check Pages publication branch
+        if: inputs.publish_pages && github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          echo "::error::Run with publish_pages from the default branch."
+          exit 1
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -197,12 +202,13 @@ jobs:
           git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
 
   publish:
-    name: Publish APK feeds to GitHub Pages
+    name: Publish retained builds to GitHub Pages
     if: inputs.publish_pages
     needs: [metadata, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      contents: write
       pages: write
       id-token: write
     environment:
@@ -211,23 +217,49 @@ jobs:
     env:
       TAG: ${{ needs.metadata.outputs.tag }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: ${{ env.TAG }}-nor
-          path: site/${{ env.TAG }}/nor
+          path: incoming/nor
       - uses: actions/download-artifact@v4
         with:
           name: ${{ env.TAG }}-ram
-          path: site/${{ env.TAG }}/ram
-      - name: Prepare Pages site
+          path: incoming/ram
+      - name: Update the gh-pages snapshot
         run: |
-          printf '<!doctype html><meta charset="utf-8"><title>EW30SX OpenWrt</title><h1>EW30SX OpenWrt</h1><p>APK feeds for build %s. Use only with images from the same run.</p><p><a href="%s/%s/actions/runs/%s">Firmware and APK archives</a></p>\n' \
-            "$TAG" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >site/index.html
+          set -euo pipefail
+          mkdir site
+          # An empty listing means a missing branch; an auth or network
+          # error must stop the job rather than discard the saved builds.
+          remote=$(git ls-remote origin refs/heads/gh-pages)
+          parent=()
+          if [[ -n "$remote" ]]; then
+            git fetch --no-tags --depth=1 origin refs/heads/gh-pages
+            prev=$(git rev-parse FETCH_HEAD)
+            git archive "$prev" | tar -x -C site
+            parent=(-p "$prev")
+          fi
+
+          bash .github/ci/prepare-pages.sh site incoming "$TAG"
+          # Use a separate index so neither source files nor incoming
+          # artifacts outside site can end up in the Pages branch.
+          export GIT_INDEX_FILE="$RUNNER_TEMP/ew30sx-pages-index"
+          git --work-tree="$PWD/site" add -A
+          tree=$(git write-tree)
+          if [[ -n "${prev:-}" && "$tree" == "$(git rev-parse "$prev^{tree}")" ]]; then exit 0; fi
+          commit=$(git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit-tree "$tree" "${parent[@]}" -m "pages: retain build $TAG")
+          git push origin "$commit:refs/heads/gh-pages"
       - uses: actions/upload-pages-artifact@v3
         with:
+          name: github-pages-${{ github.run_attempt }}
           path: site
       - id: deploy
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
 
   release:
     name: Publish GitHub prerelease

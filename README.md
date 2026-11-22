@@ -25,10 +25,13 @@ Hai profile dùng cùng một commit OpenWrt; artifact ghi lại commit và
 phiên bản các feed thực tế. Sau khi cả hai build thành công trên nhánh
 mặc định, CI ghi lại commit upstream vào gitlink. Nếu patch xung đột
 hoặc cấu hình bắt buộc bị mất, build dừng thay vì bỏ qua.
-`publish_release` tạo prerelease chứa cả hai profile. `publish_pages` cần
-đặt nguồn Pages là **GitHub Actions** trong Settings; mỗi lần deploy chỉ
-giữ feed của lượt đó. Có thể đặt biến `EW30SX_PAGES_URL` nếu dùng tên
-miền tùy chỉnh. Không trộn APK/kmod giữa các lượt build hoặc profile.
+`publish_release` tạo prerelease chứa cả hai profile. `publish_pages` chạy
+trên nhánh mặc định, lưu firmware và feed APK của ba lượt publish gần nhất
+trên `gh-pages` rồi deploy toàn bộ nhánh qua **GitHub Actions**. URL của
+mỗi build có dạng `/<tag>/<nor|ram>/apk/`; lưu APK feed từ artifact hoặc
+prerelease nếu cần dùng sau khi bản đó rời Pages. Có thể đặt biến
+`EW30SX_PAGES_URL` nếu dùng tên miền tùy chỉnh. Không trộn APK/kmod giữa
+các lượt build hoặc profile.
 
 ## Build cục bộ
 
