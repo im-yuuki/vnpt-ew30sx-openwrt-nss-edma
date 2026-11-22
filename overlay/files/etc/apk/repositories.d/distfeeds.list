@@ -1,2 +1,2 @@
-# Do not use generic rolling OpenWrt package indexes with this custom firmware.
-# GitHub Actions adds the signed APK feeds for this exact build if Pages is selected.
+# configure.sh adds this build's signed kmod index and official userspace feeds.
+# Never add the official target/kmods indexes: their kernel ABI does not match.

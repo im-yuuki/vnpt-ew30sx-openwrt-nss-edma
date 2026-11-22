@@ -12,13 +12,13 @@ cd "$root/openwrt-nss-edma"
 
 mkdir -p files
 cp -a "$root/overlay/files/." files/
-if [[ -n ${FEED_URL:-} ]]; then
-	feeds=(target base packages nss)
-	if [[ "$flavor" == nor ]]; then feeds+=(luci); fi
-	for feed in "${feeds[@]}"; do
-		printf '%s/%s/packages.adb\n' "$FEED_URL" "$feed"
-	done >>files/etc/apk/repositories.d/distfeeds.list
-fi
+{
+	cat "$root/overlay/files/etc/apk/repositories.d/distfeeds.list"
+	if [[ -n ${FEED_URL:-} ]]; then printf '%s/packages.adb\n' "$FEED_URL"; fi
+	for feed in base luci packages routing telephony video; do
+		printf 'https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/%s/packages.adb\n' "$feed"
+	done
+} >files/etc/apk/repositories.d/distfeeds.list
 
 fragments=("$ci/ew30sx.config" "$ci/ew30sx-$flavor.config")
 cat "${fragments[@]}" >.config

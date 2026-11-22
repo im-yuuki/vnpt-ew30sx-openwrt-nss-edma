@@ -5,22 +5,21 @@ export LC_ALL=C
 flavor=${1:?Pass nor or ram}
 dest=${2:?Pass the output directory}
 target=bin/targets/qualcommax/ipq50xx
-feeds=bin/packages/aarch64_cortex-a53
 prefix=openwrt-qualcommax-ipq50xx-vnpt_ew30sx
 # firewall4 requires the concrete nftables-json package. nftables is just
 # the name provided by that package, not a manifest entry.
 required=(apk-mbedtls dnsmasq dropbear firewall4 nftables-json odhcp6c odhcpd-ipv6only
-	ppp-mod-pppoe kmod-ath11k-ahb kmod-gpio-button-hotplug kmod-leds-gpio
+	ppp-mod-pppoe kmod-qca-nss-drv-pppoe kmod-ath11k-ahb kmod-gpio-button-hotplug kmod-leds-gpio
 	ath11k-firmware-ipq5018-qcn6122 nss-tools-dwmac nss-firmware-ipq50xx
-	squashfs-tools-unsquashfs)
+	squashfs-tools-unsquashfs wpad-mbedtls)
 case "$flavor" in
 nor)
 	images=("$prefix-nor-squashfs-kernel.itb" "$prefix-nor-squashfs-rootfs.squashfs")
-	required+=(luci-ssl uhttpd wpad-mbedtls)
+	required+=(luci-ssl uhttpd luci-app-nss luci-app-sqm nssinfo sqm-scripts-nss zram-swap)
 	;;
 ram)
 	images=("$prefix-initramfs-uImage.itb")
-	required+=(iperf3 wpad-basic-mbedtls)
+	required+=(iperf3)
 	;;
 *) exit 2 ;;
 esac
@@ -58,26 +57,22 @@ for pkg in "${required[@]}"; do
 	awk -v pkg="$pkg" '$1 == pkg && $2 == "-" { found = 1 } END { exit !found }' "$manifest" ||
 		{ echo "::error::missing image package: $pkg"; exit 1; }
 done
-if [[ "$flavor" == nor ]] && grep -q '^wpad-basic-mbedtls - ' "$manifest"; then
-	echo "::error::the NOR image must not contain the basic wpad variant"
+if grep -q '^wpad-basic-mbedtls - ' "$manifest"; then
+	echo "::error::the $flavor image must not contain the basic wpad variant"
 	exit 1
 fi
-for pkg in kmod-tun kmod-wireguard; do
-	compgen -G "$target/packages/$pkg-*.apk" >/dev/null
-done
+while IFS= read -r pkg; do
+	compgen -G "$target/packages/$pkg-*.apk" >/dev/null ||
+		{ echo "::error::missing signed module: $pkg"; exit 1; }
+done < <(sed -n 's/^CONFIG_PACKAGE_\(kmod-.*\)=m$/\1/p' ../.github/ci/ew30sx.config)
 
 cp "$target"/{config,feeds,version}.buildinfo "$dest/firmware/"
 printf 'wrapper=%s\nopenwrt=%s\nprofile=%s\n' \
 	"$(git -C .. rev-parse HEAD)" "$(git rev-parse HEAD)" "$flavor" >"$dest/firmware/source.txt"
 (cd "$dest/firmware" && sha256sum -- "${images[@]}" >sha256sums)
 
-for feed in target base luci packages nss; do
-	if [[ "$feed" == target ]]; then src="$target/packages"; else src="$feeds/$feed"; fi
-	# RAM deliberately has no LuCI; it may not build any LuCI packages.
-	if [[ "$flavor:$feed" == ram:luci && ! -s "$src/packages.adb" ]]; then continue; fi
-	test -s "$src/packages.adb"
-	mkdir -p "$dest/apk/$feed"
-	cp "$src"/packages.adb "$src"/*.apk "$dest/apk/$feed/"
-done
+test -s "$target/packages/packages.adb"
+mkdir -p "$dest/apk/target"
+cp "$target"/packages/{packages.adb,*.apk} "$dest/apk/target/"
 test -s public-key.pem
 cp public-key.pem "$dest/apk/"

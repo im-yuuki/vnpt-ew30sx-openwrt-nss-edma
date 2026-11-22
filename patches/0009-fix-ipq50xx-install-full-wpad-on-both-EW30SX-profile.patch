@@ -1,0 +1,30 @@
+From 9a33b1e22333c9eaeee80dfcec8ef9db2d0f5285 Mon Sep 17 00:00:00 2001
+From: Yuuki <me@june8th.eu.org>
+Date: Sun, 22 Nov 2026 21:37:11 +0700
+Subject: [PATCH] fix(ipq50xx): install full wpad on both EW30SX profiles
+
+---
+ target/linux/qualcommax/image/ipq50xx.mk | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/target/linux/qualcommax/image/ipq50xx.mk b/target/linux/qualcommax/image/ipq50xx.mk
+index f2bafdb0bd..ac82b9d47c 100644
+--- a/target/linux/qualcommax/image/ipq50xx.mk
++++ b/target/linux/qualcommax/image/ipq50xx.mk
+@@ -807,6 +807,7 @@ define Device/vnpt_ew30sx-common
+ 		nss-tools-dwmac \
+ 		squashfs-tools-unsquashfs \
+ 		ip-full \
++		-wpad-basic-mbedtls wpad-mbedtls \
+ 		-kmod-usb3 -kmod-usb-dwc3 -kmod-usb-dwc3-qcom \
+ 		-e2fsprogs -kmod-fs-ext4 -losetup -uboot-envtools
+ endef
+@@ -826,8 +827,6 @@ define Device/vnpt_ew30sx-nor
+ 	$(call Device/FitImageLzma)
+ 	DEVICE_VARIANT := NOR beta
+ 	DEVICE_DTS := ipq5018-vnpt-ew30sx-nor
+-	# Full wpad provides opt-in WPS and 802.11s; the basic variant does not.
+-	DEVICE_PACKAGES += -wpad-basic-mbedtls wpad-mbedtls
+ 	BLOCKSIZE := 64k
+ 	KERNEL_SIZE := 5120k
+ 	KERNEL_INITRAMFS :=

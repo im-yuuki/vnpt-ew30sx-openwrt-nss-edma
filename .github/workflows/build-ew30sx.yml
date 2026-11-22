@@ -1,12 +1,11 @@
 name: Build EW30SX firmware + signed APK feeds
 
 on:
+  # The reference schedule is intentionally disabled; builds are manual.
+  # schedule:
+  #   - cron: '0 0 */14 * *'
   workflow_dispatch:
     inputs:
-      publish_pages:
-        description: Publish firmware and signed APK feeds on GitHub Pages (keep the latest three builds)
-        type: boolean
-        default: false
       publish_release:
         description: Publish a GitHub prerelease with both image profiles and their feeds
         type: boolean
@@ -30,11 +29,6 @@ jobs:
       upstream: ${{ steps.upstream.outputs.commit }}
       gitmodules: ${{ steps.upstream.outputs.gitmodules }}
     steps:
-      - name: Check Pages publication branch
-        if: inputs.publish_pages && github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
-        run: |
-          echo "::error::Run with publish_pages from the default branch."
-          exit 1
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -102,22 +96,42 @@ jobs:
 
       - name: Configure firmware
         env:
-          PUBLISH_PAGES: ${{ inputs.publish_pages }}
+          PUBLISH_PAGES: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
         run: |
           set -euo pipefail
           if [[ "$PUBLISH_PAGES" == true ]]; then
-            export FEED_URL="${PAGES_BASE%/}/$TAG/$FLAVOR/apk"
+            export FEED_URL="${PAGES_BASE%/}/$TAG/$FLAVOR/apk/target"
           fi
           bash .github/ci/configure.sh "$FLAVOR"
 
-      - name: Cache source archives and compilation
-        uses: actions/cache@v4
+      - name: Compute compiler cache keys
+        id: cache
+        working-directory: openwrt-nss-edma
+        run: |
+          set -euo pipefail
+          inputs=$({
+            git rev-parse HEAD
+            ./scripts/feeds list -fs
+            ./scripts/diffconfig.sh
+            sha256sum ../patches/*.patch
+          } | sha256sum | cut -c1-24)
+          toolchain=$({
+            git rev-parse HEAD:toolchain HEAD:tools/ccache
+            grep -E '^CONFIG_(ARCH|BINUTILS|GCC|LIBC|MUSL|TARGET_OPTIMIZATION)' .config
+            gcc --version
+            as --version
+            getconf GNU_LIBC_VERSION
+          } | sha256sum | cut -c1-24)
+          echo "inputs=$inputs" >>"$GITHUB_OUTPUT"
+          echo "ccache-prefix=ew30sx-ccache-v1-$FLAVOR-$RUNNER_OS-$RUNNER_ARCH-${ImageOS:-unknown}-$toolchain-" >>"$GITHUB_OUTPUT"
+
+      - name: Restore source archives
+        id: sources
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            openwrt-nss-edma/dl
-            openwrt-nss-edma/.ccache
-          key: ew30sx-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.flavor }}-${{ env.UPSTREAM_COMMIT }}-${{ github.sha }}
-          restore-keys: ew30sx-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.flavor }}-
+          path: openwrt-nss-edma/dl
+          key: ew30sx-dl-v1-inventory
+          restore-keys: ew30sx-dl-v1-
 
       - name: Download sources
         working-directory: openwrt-nss-edma
@@ -131,10 +145,35 @@ jobs:
           for attempt in 1 2 3; do
             if timeout --kill-after=60 20m make download -j"$(nproc)"; then exit 0; fi
             echo "::warning::source download attempt $attempt failed"
+            find dl -maxdepth 1 -name '*.dl' -printf '::warning::unfinished: %f (%s bytes)\n' || true
           done
           exit 1
 
-      - name: Build firmware and index APK repositories
+      - name: Inventory downloaded archives
+        id: archives
+        working-directory: openwrt-nss-edma
+        run: |
+          set -euo pipefail
+          find dl -maxdepth 1 -type f \( -name '*.dl' -o -name '*.hash' \) -delete
+          inventory=$(find dl -maxdepth 1 -type f -printf '%f %s\n' | LC_ALL=C sort | sha256sum | cut -c1-24)
+          echo "key=ew30sx-dl-v1-$inventory" >>"$GITHUB_OUTPUT"
+
+      - name: Save source archives
+        if: steps.archives.outputs.key != steps.sources.outputs.cache-matched-key
+        uses: actions/cache/save@v6
+        with:
+          path: openwrt-nss-edma/dl
+          key: ${{ steps.archives.outputs.key }}
+
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: openwrt-nss-edma/.ccache
+          key: ${{ steps.cache.outputs.ccache-prefix }}${{ steps.cache.outputs.inputs }}
+          restore-keys: ${{ steps.cache.outputs.ccache-prefix }}
+
+      - name: Build firmware
         working-directory: openwrt-nss-edma
         env:
           CCACHE_COMPILERCHECK: content
@@ -145,17 +184,37 @@ jobs:
             make -j1 V=s 2>&1 | tail -300
             exit 1
           fi
+
+      - name: Save compiler cache
+        if: steps.ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: openwrt-nss-edma/.ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Verify firmware and collect the signed matching kmod feed
+        working-directory: openwrt-nss-edma
+        run: |
+          set -euo pipefail
           make package/index
           bash ../.github/ci/collect.sh "$FLAVOR" "../out/$FLAVOR"
 
-      - name: Upload firmware and matching signed APK feeds
+      - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.TAG }}-${{ matrix.flavor }}
-          path: out/${{ matrix.flavor }}/
+          name: firmware-${{ env.TAG }}-${{ matrix.flavor }}
+          path: out/${{ matrix.flavor }}/firmware/
           if-no-files-found: error
           compression-level: 0
-          retention-days: 14
+          retention-days: 3
+      - name: Upload matching signed kmod feed
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmods-${{ env.TAG }}-${{ matrix.flavor }}
+          path: out/${{ matrix.flavor }}/apk/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
 
   update_submodule:
     name: Record successful upstream revision
@@ -203,7 +262,7 @@ jobs:
 
   publish:
     name: Publish retained builds to GitHub Pages
-    if: inputs.publish_pages
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: [metadata, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -220,25 +279,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ env.TAG }}-nor
-          path: incoming/nor
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.TAG }}-ram
-          path: incoming/ram
+          pattern: "*-${{ env.TAG }}-*"
+          path: artifacts
       - name: Update the gh-pages snapshot
         run: |
           set -euo pipefail
           mkdir site
+          for flavor in nor ram; do
+            mkdir -p "incoming/$flavor"
+            mv "artifacts/firmware-$TAG-$flavor" "incoming/$flavor/firmware"
+            mv "artifacts/kmods-$TAG-$flavor" "incoming/$flavor/apk"
+          done
           # An empty listing means a missing branch; an auth or network
           # error must stop the job rather than discard the saved builds.
           remote=$(git ls-remote origin refs/heads/gh-pages)
-          parent=()
+          prev=''
           if [[ -n "$remote" ]]; then
             git fetch --no-tags --depth=1 origin refs/heads/gh-pages
             prev=$(git rev-parse FETCH_HEAD)
             git archive "$prev" | tar -x -C site
-            parent=(-p "$prev")
           fi
 
           bash .github/ci/prepare-pages.sh site incoming "$TAG"
@@ -247,11 +306,13 @@ jobs:
           export GIT_INDEX_FILE="$RUNNER_TEMP/ew30sx-pages-index"
           git --work-tree="$PWD/site" add -A
           tree=$(git write-tree)
-          if [[ -n "${prev:-}" && "$tree" == "$(git rev-parse "$prev^{tree}")" ]]; then exit 0; fi
+          if [[ -n "$prev" && "$tree" == "$(git rev-parse "$prev^{tree}")" ]]; then exit 0; fi
+          # gh-pages is generated: one snapshot commit, without stale
+          # binaries in history. Never overwrite a concurrent publication.
           commit=$(git -c user.name='github-actions[bot]' \
             -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit-tree "$tree" "${parent[@]}" -m "pages: retain build $TAG")
-          git push origin "$commit:refs/heads/gh-pages"
+            commit-tree "$tree" -m "pages: retain build $TAG")
+          git push --force-with-lease="refs/heads/gh-pages:$prev" origin "$commit:refs/heads/gh-pages"
       - uses: actions/upload-pages-artifact@v3
         with:
           name: github-pages-${{ github.run_attempt }}
@@ -263,7 +324,7 @@ jobs:
 
   release:
     name: Publish GitHub prerelease
-    if: ${{ !cancelled() && inputs.publish_release && needs.build.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    if: inputs.publish_release && needs.publish.result == 'success'
     needs: [metadata, build, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -275,24 +336,32 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ env.TAG }}-nor
-          path: dist/nor
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.TAG }}-ram
-          path: dist/ram
-      - name: Archive and publish both profiles
+          pattern: "*-${{ env.TAG }}-*"
+          path: artifacts
+      - name: Publish raw firmware and matching kmod archives
         run: |
           set -euo pipefail
+          mkdir release
           for flavor in nor ram; do
-            tar -czf "$TAG-$flavor-firmware.tar.gz" -C "dist/$flavor/firmware" .
-            tar -czf "$TAG-$flavor-apk.tar.gz" -C "dist/$flavor/apk" .
+            firmware="artifacts/firmware-$TAG-$flavor"
+            feed="artifacts/kmods-$TAG-$flavor"
+            test -s "$feed/target/packages.adb"
+            test -s "$feed/public-key.pem"
+            for file in "$firmware"/*; do
+              name=${file##*/}
+              case "$name" in
+                sha256sums) continue ;;
+                *.itb|*.squashfs) cp "$file" "release/$name" ;;
+                *) cp "$file" "release/$flavor-$name" ;;
+              esac
+            done
+            tar -czf "release/$TAG-$flavor-apk-feed.tar.gz" -C "$feed" .
           done
-          sha256sum -- "$TAG"-*.tar.gz >sha256sums
+          (cd release && sha256sum -- *.itb *.squashfs *.tar.gz >sha256sums)
           printf '%s\n' \
             'EW30SX experimental build. The split NOR pair is not a factory or sysupgrade image.' \
             'Never flash the RAM FIT. Keep each profile with its own signed APK feeds.' \
             "Build log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >release-notes.md
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "EW30SX OpenWrt $TAG" --prerelease --notes-file release-notes.md \
-            "$TAG"-*.tar.gz sha256sums
+            release/*
