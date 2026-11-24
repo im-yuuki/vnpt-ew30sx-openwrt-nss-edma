@@ -1,0 +1,21 @@
+From f5d469aa332aeb32d8d04f46414de3697018127b Mon Sep 17 00:00:00 2001
+From: Yuuki <me@june8th.eu.org>
+Date: Tue, 24 Nov 2026 03:47:39 +0700
+Subject: [PATCH] refactor(ipq50xx): omit iperf3 from the EW30SX RAM profile
+
+---
+ target/linux/qualcommax/image/ipq50xx.mk | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/target/linux/qualcommax/image/ipq50xx.mk b/target/linux/qualcommax/image/ipq50xx.mk
+index ac82b9d47c..85b831ab96 100644
+--- a/target/linux/qualcommax/image/ipq50xx.mk
++++ b/target/linux/qualcommax/image/ipq50xx.mk
+@@ -816,7 +816,6 @@ define Device/vnpt_ew30sx
+ 	$(call Device/vnpt_ew30sx-common)
+ 	$(call Device/FitImage)
+ 	DEVICE_DTS := ipq5018-vnpt-ew30sx
+-	DEVICE_PACKAGES += iperf3
+ 	IMAGES :=
+ 	KERNEL_INITRAMFS := kernel-bin | libdeflate-gzip | fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd
+ endef

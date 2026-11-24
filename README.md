@@ -6,7 +6,7 @@ SPI-NOR). Board-specific changes live in `patches/`; CI builds the latest
 
 | Profile | Output | Purpose |
 |---|---|---|
-| `nor` | Separate kernel FIT and SquashFS root filesystem | Boots from flash. Includes LuCI over HTTPS, NSS and SQM controls, zram, and diagnostics. |
+| `nor` | Separate kernel FIT and SquashFS root filesystem | Boots from flash. Includes LuCI over HTTPS and NSS/SQM controls. |
 | `ram` | Initramfs FIT | Temporary boot over UART/TFTP for recovery and diagnosis. **Do not flash this FIT.** |
 
 An earlier NOR beta booted from stock U-Boot, accepted LAN SSH, and detected

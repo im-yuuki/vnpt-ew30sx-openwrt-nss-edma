@@ -15,11 +15,10 @@ required=(apk-mbedtls dnsmasq dropbear firewall4 nftables-json odhcp6c odhcpd-ip
 case "$flavor" in
 nor)
 	images=("$prefix-nor-squashfs-kernel.itb" "$prefix-nor-squashfs-rootfs.squashfs")
-	required+=(luci-ssl uhttpd luci-app-nss luci-app-sqm nssinfo sqm-scripts-nss zram-swap)
+	required+=(luci-ssl uhttpd luci-app-nss luci-app-sqm nssinfo sqm-scripts-nss)
 	;;
 ram)
 	images=("$prefix-initramfs-uImage.itb")
-	required+=(iperf3)
 	;;
 *) exit 2 ;;
 esac
@@ -63,8 +62,8 @@ if grep -q '^wpad-basic-mbedtls - ' "$manifest"; then
 fi
 while IFS= read -r pkg; do
 	compgen -G "$target/packages/$pkg-*.apk" >/dev/null ||
-		{ echo "::error::missing signed module: $pkg"; exit 1; }
-done < <(sed -n 's/^CONFIG_PACKAGE_\(kmod-.*\)=m$/\1/p' ../.github/ci/ew30sx.config)
+		{ echo "::error::missing signed package: $pkg"; exit 1; }
+done < <(sed -nE 's/^CONFIG_PACKAGE_(kmod-[^=]+)=m$/\1/p' ../.github/ci/ew30sx.config)
 
 cp "$target"/{config,feeds,version}.buildinfo "$dest/firmware/"
 printf 'wrapper=%s\nopenwrt=%s\nprofile=%s\n' \
